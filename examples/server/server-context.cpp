@@ -4315,6 +4315,11 @@ void server_context::speculative_decoding_accept() {
 
         // rollback to the state before sampling the draft tokens
         slot.cache_tokens.keep_first(slot.cache_tokens.n_tokens() - n_draft);
+        // the sampled token occupies the last slot after the rollback, so the
+        // first draft (and every accepted token) starts at pos_next(). this is
+        // the same pos_base semantic used by main.cpp (n_past + 1): the commit's
+        // seq_rm(pos_base + ids.size()-1) then keeps all accepted cells on a
+        // fully-accepted round instead of deleting the last accepted cell.
         const llama_pos spec_pos_base = slot.cache_tokens.pos_next();
 
         // add accepted tokens to the prompt
