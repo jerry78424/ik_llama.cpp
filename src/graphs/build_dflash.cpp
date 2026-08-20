@@ -1,7 +1,9 @@
 #include "../llama-build-context.h"
 #include "../llama-context.h"
 #include "../llama-model.h"
+#include "build_dspark.h"
 
+#include <algorithm>
 #include <cmath>
 
 static ggml_tensor * build_dflash2_conv(
@@ -63,11 +65,13 @@ static ggml_tensor * build_dflash2_conv(
     return result;
 }
 
-ggml_tensor * llm_build_context::build_dspark_logits(
+ggml_tensor * build_dspark_logits(
         llm_build_context & llm,
         ggml_tensor * base_logits,
         ggml_tensor * input_tokens,
-        ggml_tensor ** draft_tokens_out) {
+        ggml_tensor * input_embd,
+        ggml_tensor ** draft_tokens_out,
+        ggml_tensor ** conf_out) {
     ggml_context * ctx0 = llm.ctx0;
     const llama_model & model = llm.model;
 
@@ -76,39 +80,115 @@ ggml_tensor * llm_build_context::build_dspark_logits(
     GGML_ASSERT(input_tokens != nullptr);
     GGML_ASSERT(base_logits->ne[1] == input_tokens->ne[0]);
 
-    const int64_t n_vocab  = base_logits->ne[0];
-    const int64_t n_tokens = base_logits->ne[1];
-    GGML_ASSERT(n_tokens > 0);
+    const int64_t n_vocab = base_logits->ne[0];
+    const int64_t n_tok   = base_logits->ne[1];
+    GGML_ASSERT(n_tok > 0);
 
-    ggml_tensor * previous = ggml_view_1d(ctx0, input_tokens, 1, 0);
-    ggml_tensor * chained = nullptr;
-    ggml_tensor * draft_tokens = nullptr;
+    const int64_t block_size = (int64_t) llm.hparams.dflash_block_size;
+    GGML_ASSERT(block_size > 0);
 
-    for (int64_t i = 0; i < n_tokens; ++i) {
-        ggml_tensor * markov_w1 = ggml_get_rows_ext(
-                ctx0, model.dspark_markov_w1, previous, true, false);
-        ggml_tensor * markov_bias = ggml_mul_mat(ctx0, model.dspark_markov_w2, markov_w1);
-        ggml_tensor * base_row = ggml_view_2d(
-                ctx0,
-                base_logits,
-                n_vocab,
-                1,
-                base_logits->nb[1],
-                (size_t) i * base_logits->nb[1]);
-        ggml_tensor * biased_row = ggml_add(ctx0, base_row, markov_bias);
-        ggml_tensor * token = ggml_argmax(ctx0, biased_row);
+    // each block is an independent Markov chain; n_blocks == number of unique sequences in the batch
+    const llama_batch & batch = llm.batch;
+    int64_t n_blocks = 1;
+    if (batch.seq_id != nullptr) {
+        std::vector<llama_seq_id> uniq;
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            const int32_t n_sid = batch.n_seq_id != nullptr ? batch.n_seq_id[i] : 1;
+            for (int32_t s = 0; s < n_sid; ++s) {
+                const llama_seq_id sid = batch.seq_id[i][s];
+                if (std::find(uniq.begin(), uniq.end(), sid) == uniq.end()) {
+                    uniq.push_back(sid);
+                }
+            }
+        }
+        n_blocks = (int64_t) uniq.size();
+    }
+    GGML_ASSERT(n_blocks > 0);
 
-        chained = chained == nullptr ? biased_row : ggml_concat(ctx0, chained, biased_row, 1);
-        draft_tokens = draft_tokens == nullptr ? token : ggml_concat(ctx0, draft_tokens, token, 0);
-        if (i + 1 < n_tokens) {
-            previous = token;
+    // runtime tokens per block (anchor + drafted positions); must divide the batch evenly
+    GGML_ASSERT(n_tok % n_blocks == 0);
+    const int64_t block_drafts = n_tok / n_blocks;
+
+    if (draft_tokens_out != nullptr) {
+        // fallback: keep a complete argmax chain over the base logits
+        *draft_tokens_out = ggml_argmax(ctx0, base_logits);
+    }
+    if (conf_out != nullptr) {
+        *conf_out = nullptr;
+    }
+
+    if (block_drafts > block_size) {
+        // batch larger than a single speculation window (e.g. prompt prefill): leave logits unchanged
+        return base_logits;
+    }
+
+    // anchor (committed/seed) token of every block: first token of each block, a strided view
+    const size_t token_stride = (size_t) block_drafts * input_tokens->nb[0];
+    ggml_tensor * prev = ggml_view_2d(ctx0, input_tokens, 1, n_blocks, token_stride, 0);
+    prev = ggml_cont_1d(ctx0, prev, n_blocks);
+
+    ggml_tensor * cat      = nullptr;
+    ggml_tensor * cat_draft = nullptr;
+    ggml_tensor * cat_conf = nullptr;
+
+    // the in-graph chain is greedy (argmax); sampling params only affect the final token pick
+    for (int64_t i = 0; i < block_drafts; ++i) {
+        ggml_tensor * w1_prev = ggml_get_rows_ext(ctx0, model.dspark_markov_w1, prev, true, false); // [R, n_blocks]
+        ggml_tensor * bias    = ggml_mul_mat(ctx0, model.dspark_markov_w2, w1_prev); // [n_vocab, n_blocks]
+
+        // position i of every block: strided view over the block-major base logits
+        ggml_tensor * base_i = ggml_view_2d(ctx0, base_logits, n_vocab, n_blocks,
+                (size_t) block_drafts * base_logits->nb[1], (size_t) i * base_logits->nb[1]);
+        ggml_tensor * col = ggml_add(ctx0, base_i, bias);
+
+        cat = cat == nullptr ? col : ggml_concat(ctx0, cat, col, 1);
+
+        // conf(i) = sigmoid(conf_proj . [embd(i); markov_w1[prev(i)]] + b) -- [1, n_blocks]
+        if (input_embd != nullptr && model.dspark_conf_proj != nullptr) {
+            ggml_tensor * conf_inp_i = ggml_view_2d(ctx0, input_embd, input_embd->ne[0], n_blocks,
+                    (size_t) block_drafts * input_embd->nb[1], (size_t) i * input_embd->nb[1]);
+            // markov_w1 is BF16; concat along dim 0 requires both inputs F32, so upcast the gathered rows
+            ggml_tensor * w1_prev_f32 = ggml_cast(ctx0, w1_prev, GGML_TYPE_F32);
+            ggml_tensor * feat = ggml_concat(ctx0, ggml_cont(ctx0, conf_inp_i), w1_prev_f32, 0);
+            ggml_tensor * conf = ggml_mul_mat(ctx0, model.dspark_conf_proj, feat);
+            if (model.dspark_conf_proj_b != nullptr) {
+                conf = ggml_add(ctx0, conf, model.dspark_conf_proj_b);
+            }
+            conf = ggml_sigmoid(ctx0, conf);
+            cat_conf = cat_conf == nullptr ? conf : ggml_concat(ctx0, cat_conf, conf, 1);
+        }
+
+        ggml_tensor * token = ggml_argmax(ctx0, col); // [n_blocks]
+        cat_draft = cat_draft == nullptr ? token : ggml_concat(ctx0, cat_draft, token, 0);
+        if (i + 1 < block_drafts) {
+            prev = token;
         }
     }
 
+    // cat is position-major [position, block]; restore ubatch block-major [block, position]
+    ggml_tensor * out = ggml_reshape_3d(ctx0, cat, n_vocab, n_blocks, block_drafts);
+    out = ggml_cont(ctx0, ggml_permute(ctx0, out, 0, 2, 1, 3)); // [n_vocab, block_drafts, n_blocks]
+    out = ggml_reshape_2d(ctx0, out, n_vocab, n_tok);
+
+    // draft tokens: position-major [block], convert to block-major 1D [n_tok] aligned with `out`
+    ggml_tensor * draft = ggml_reshape_3d(ctx0, cat_draft, n_blocks, block_drafts, 1);
+    draft = ggml_cont(ctx0, ggml_permute(ctx0, draft, 1, 0, 2, 3)); // [block_drafts, n_blocks]
+    draft = ggml_reshape_1d(ctx0, draft, n_tok);
     if (draft_tokens_out != nullptr) {
-        *draft_tokens_out = draft_tokens;
+        *draft_tokens_out = draft;
     }
-    return chained;
+
+    if (cat_conf != nullptr) {
+        ggml_tensor * conf = ggml_reshape_3d(ctx0, cat_conf, 1, n_blocks, block_drafts);
+        conf = ggml_cont(ctx0, ggml_permute(ctx0, conf, 0, 2, 1, 3)); // [1, block_drafts, n_blocks]
+        conf = ggml_reshape_2d(ctx0, conf, 1, n_tok);
+        ggml_set_name(conf, "dspark_conf");
+        if (conf_out != nullptr) {
+            *conf_out = conf;
+        }
+    }
+
+    return out;
 }
 
 ggml_cgraph * llm_build_context::build_dflash_kv_cache() {
@@ -427,6 +507,8 @@ ggml_cgraph * llm_build_context::build_dflash() {
     GGML_ASSERT(tok_embd != nullptr);
 
     ggml_tensor * inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, tok_embd, cb);
+    // input token embeddings for the DSpark confidence head (lctx.inp_embd is not set on the token path)
+    ggml_tensor * dspark_conf_inp = inpL;
     ggml_tensor * inp_pos = build_inp_pos();
     ggml_tensor * inp_out_ids = (!llm_arch_requires_all_graph_output_rows(model.arch) &&
             n_tokens > 1 && n_outputs < n_tokens) ? build_inp_out_ids() : nullptr;
@@ -700,8 +782,9 @@ ggml_cgraph * llm_build_context::build_dflash() {
     }
 
     ggml_tensor * draft_tokens = nullptr;
+    ggml_tensor * dspark_conf = nullptr;
     if (lctx.dflash.dspark) {
-        result = build_dspark_logits(*this, result, lctx.inp_tokens, &draft_tokens);
+        result = build_dspark_logits(*this, result, lctx.inp_tokens, dspark_conf_inp, &draft_tokens, &dspark_conf);
         cb(result, "result_output", -1);
     } else {
         draft_tokens = ggml_argmax(ctx0, result);
@@ -709,6 +792,9 @@ ggml_cgraph * llm_build_context::build_dflash() {
     ggml_set_name(draft_tokens, "draft_argmax");
     ggml_build_forward_expand(gf, result);
     ggml_build_forward_expand(gf, draft_tokens);
+    if (dspark_conf != nullptr) {
+        ggml_build_forward_expand(gf, dspark_conf);
+    }
     lctx.dflash.draft_tokens_tensor = draft_tokens;
 
     return gf;

@@ -2,6 +2,7 @@
 #include "../llama-context.h"
 #include "../llama-build-context.h"
 #include "../llama-dsv4.h"
+#include "build_dspark.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1544,6 +1545,8 @@ ggml_cgraph * llm_build_context::build_dflash_dsv4() {
     ggml_tensor * tok_embd = model.tok_embd;
     GGML_ASSERT(tok_embd != nullptr);
     ggml_tensor * inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, tok_embd, cb);
+    // input token embeddings for the DSpark confidence head (lctx.inp_embd is not set on the token path)
+    ggml_tensor * dspark_conf_inp = inpL;
     inpL = ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens);
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hparams.dsv4_hc_mult, n_tokens, 1);
     cb(inpL, "dsv4_dflash_hc_init", -1);
@@ -1669,9 +1672,10 @@ ggml_cgraph * llm_build_context::build_dflash_dsv4() {
 
     lctx.dflash.draft_tokens_tensor = nullptr;
     ggml_tensor * draft_tokens = nullptr;
+    ggml_tensor * dspark_conf = nullptr;
     ggml_tensor * result = out;
     if (lctx.dflash.dspark) {
-        result = build_dspark_logits(*this, out, lctx.inp_tokens, &draft_tokens);
+        result = build_dspark_logits(*this, out, lctx.inp_tokens, dspark_conf_inp, &draft_tokens, &dspark_conf);
         cb(result, "result_output", -1);
     } else {
         draft_tokens = ggml_argmax(ctx0, result);
@@ -1679,6 +1683,9 @@ ggml_cgraph * llm_build_context::build_dflash_dsv4() {
     ggml_set_name(draft_tokens, "draft_argmax");
     ggml_build_forward_expand(gf, result);
     ggml_build_forward_expand(gf, draft_tokens);
+    if (dspark_conf != nullptr) {
+        ggml_build_forward_expand(gf, dspark_conf);
+    }
     lctx.dflash.draft_tokens_tensor = draft_tokens;
     return gf;
 }

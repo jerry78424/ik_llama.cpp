@@ -354,7 +354,11 @@ struct common_speculative_state_dflash : public common_speculative_state {
         }
 
         if (!llama_set_dflash_target_features_view(ctx_dft, target_features, target_feature_floats, target_window_rows, target_window_pos.data(), &window_update)) {
-            LOG_ERR("%s: failed to set DFlash target features\n", __func__);
+            LOG_ERR("%s: failed to set DFlash target features (rows=%d append=%d replace=%d last_target_pos=%d first=%d last=%d)\n",
+                    __func__, target_window_rows, window_update.append_rows, window_update.replace,
+                    (int) last_target_pos,
+                    (int) (target_window_pos.empty() ? -1 : target_window_pos.front()),
+                    (int) (target_window_pos.empty() ? -1 : target_window_pos.back()));
             return;
         }
 
@@ -663,23 +667,68 @@ static bool dflash_append_target_features(
     }
 
     const int32_t keep_old_rows = std::min<int32_t>(state.target_window_rows, state.cross_ctx - n_rows);
+    const llama_pos tail_pos = keep_old_rows > 0 ? state.target_window_pos.back() : (llama_pos) -1;
+
+    // filter out any rows whose positions are not strictly increasing past the
+    // retained window tail (e.g. DFlash checkpoint restore re-decodes positions
+    // that were already appended by the previous commit). each row is checked
+    // individually so internal reordering or duplicates are also dropped.
+    std::vector<llama_pos> kept_positions;
+    std::vector<float> kept_rows;
+    kept_positions.reserve((size_t) n_rows);
+    kept_rows.reserve(new_rows.size());
+    llama_pos last_kept = tail_pos;
+    for (int32_t i = 0; i < n_rows; ++i) {
+        if (new_positions[i] <= last_kept) {
+            continue;
+        }
+        last_kept = new_positions[i];
+        kept_positions.push_back(new_positions[i]);
+        kept_rows.insert(kept_rows.end(),
+                new_rows.begin() + (ptrdiff_t) i * (ptrdiff_t) row_width,
+                new_rows.begin() + (ptrdiff_t) (i + 1) * (ptrdiff_t) row_width);
+    }
+    const int32_t n_append = (int32_t) kept_positions.size();
+    if (n_append <= 0) {
+        return true;
+    }
+
+    if (n_rows != n_append) {
+        std::string dropped_str;
+        std::string kept_str;
+        for (int32_t i = 0; i < n_rows; ++i) {
+            if (new_positions[i] <= tail_pos) {
+                if (!dropped_str.empty()) dropped_str += ",";
+                dropped_str += std::to_string((int) new_positions[i]);
+            }
+        }
+        for (size_t i = 0; i < kept_positions.size(); ++i) {
+            if (!kept_str.empty()) kept_str += ",";
+            kept_str += std::to_string((int) kept_positions[i]);
+        }
+        LLAMA_LOG_INFO("%s: dropped %d overlapping rows (tail_pos=%d) dropped=[%s] kept=[%s] new_all=[%d..%d]\n",
+                __func__, n_rows - n_append, (int) tail_pos,
+                dropped_str.c_str(), kept_str.c_str(),
+                (int) new_positions.front(), (int) new_positions.back());
+    }
+
     std::vector<llama_pos> & next_window_pos = state.target_window_pos_stage;
-    next_window_pos.resize((size_t) (keep_old_rows + n_rows));
+    next_window_pos.resize((size_t) (keep_old_rows + n_append));
 
     if (keep_old_rows > 0) {
         std::copy(state.target_window_pos.end() - keep_old_rows, state.target_window_pos.end(), next_window_pos.begin());
     }
 
-    state.target_window_append_features.assign(new_rows.begin(), new_rows.end());
-    dflash_ring_append_rows(state, state.target_window_append_features.data(), n_rows);
-    std::copy(new_positions.begin(), new_positions.end(), next_window_pos.begin() + keep_old_rows);
+    state.target_window_append_features.assign(kept_rows.begin(), kept_rows.end());
+    dflash_ring_append_rows(state, state.target_window_append_features.data(), n_append);
+    std::copy(kept_positions.begin(), kept_positions.end(), next_window_pos.begin() + keep_old_rows);
 
     state.target_window_pos.swap(next_window_pos);
     next_window_pos.clear();
-    state.target_window_rows = keep_old_rows + n_rows;
+    state.target_window_rows = keep_old_rows + n_append;
     state.target_window_ring_filled = state.target_window_rows;
     state.last_target_pos = state.target_window_pos.empty() ? -1 : state.target_window_pos.back();
-    dflash_record_window_update(state, keep_old_rows, n_rows, false);
+    dflash_record_window_update(state, keep_old_rows, n_append, false);
     return true;
 }
 

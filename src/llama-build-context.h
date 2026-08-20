@@ -524,10 +524,6 @@ struct llm_build_context {
          ggml_tensor * post_norm = nullptr, float post_norm_eps = 0.0f,
          post_norm_data * pnd = nullptr);
 
-    static ggml_tensor * build_dspark_logits(llm_build_context & llm,
-            ggml_tensor * base_logits, ggml_tensor * input_tokens,
-            ggml_tensor ** draft_tokens = nullptr);
-
     static ggml_tensor * llm_build_moe_ffn(ggml_context * ctx, llama_context & lctx,
          ggml_tensor * cur,
          ggml_tensor * gate_inp,   ggml_tensor * gate_inp_b,

@@ -471,8 +471,18 @@ bool llama_prepare_dflash_graph_inputs(
     const llama_pos last_target_pos = src_pos[n_rows - 1];
     for (int32_t i = 1; i < n_rows; ++i) {
         if (src_pos[i] <= src_pos[i - 1]) {
-            LLAMA_LOG_ERROR("%s: DFlash target positions are not strictly increasing (rows=%d first=%d last=%d)\n",
-                    __func__, n_rows, (int) src_pos[0], (int) src_pos[n_rows - 1]);
+            std::string full;
+            full.reserve((size_t) n_rows * 6);
+            for (int32_t j = 0; j < n_rows; ++j) {
+                full += std::to_string((int) src_pos[j]);
+                if (j + 1 < n_rows) full += ",";
+            }
+            LLAMA_LOG_ERROR(
+                    "%s: DFlash target positions are not strictly increasing (rows=%d first=%d last=%d) "
+                    "violation at i=%d pos[%d]=%d pos[%d]=%d full=[%s]\n",
+                    __func__, n_rows, (int) src_pos[0], (int) src_pos[n_rows - 1],
+                    i, i - 1, (int) src_pos[i - 1], i, (int) src_pos[i],
+                    full.c_str());
             return false;
         }
     }
