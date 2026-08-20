@@ -16,3 +16,4 @@ enum llama_spec_ckpt_restore_result llama_dsv4_spec_ckpt_restore(llama_context *
 void llama_dsv4_spec_ckpt_discard(llama_context * ctx);
 ggml_tensor * llama_dsv4_spec_ckpt_delta(llama_context * ctx, ggml_tensor * state_tensor);
 void llama_dsv4_spec_ckpt_record_plan(llama_context * ctx);
+void llama_dsv4_spec_ckpt_log_state(llama_context * ctx, const char * tag, int64_t n_past, const llama_token * tokens = nullptr, int32_t n_tokens = 0, const llama_pos * positions = nullptr);

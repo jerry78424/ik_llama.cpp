@@ -20,6 +20,7 @@
 #include "llama-spec-features.h"
 #include "llama-dflash.h"
 #include "llama-dsv4.h"
+#include "dsv4_trace.h"
 #include "llama-quantize.h"
 
 #include "unicode.h"
@@ -6913,11 +6914,35 @@ static int llama_decode_internal(
         //fprintf(stderr, "%s: invoking llama_graph_compute\n", __func__);
         llama_graph_compute(lctx, gf, n_threads);
 
+        dsv4_trace::emit("compute", "\"n_tokens\":%d,\"head_before\":%lld", (int) n_tokens, (long long) kv_self.head);
+
+        if (std::getenv("IK_DSV4_TRACE") != nullptr && lctx.model.arch == LLM_ARCH_DEEPSEEK4) {
+            const char * tnames[] = { "attn_norm-0", "kv_b-0", "kv_rope-0", "blk.0.attn_kv.weight" };
+            for (const char * tn : tnames) {
+                ggml_tensor * t = nullptr;
+                for (int i = 0; i < gf->n_nodes && t == nullptr; ++i) {
+                    if (strcmp(gf->nodes[i]->name, tn) == 0) t = gf->nodes[i];
+                }
+                for (int i = 0; i < gf->n_leafs && t == nullptr; ++i) {
+                    if (strcmp(gf->leafs[i]->name, tn) == 0) t = gf->leafs[i];
+                }
+                if (t != nullptr) {
+                    dsv4_trace::emit_tensor(tn, t, 169, 8);
+                }
+            }
+        }
+
         if (lctx.model.arch == LLM_ARCH_DEEPSEEK4 &&
             lctx.cparams.mtp_op_type == MTP_OP_NONE &&
             lctx.kv_self.ckpt.selected_spec_mode == LLAMA_SPEC_CKPT_PER_STEP &&
             !llama_dsv4_spec_ckpt_capture_rows(&lctx)) {
             return GGML_STATUS_FAILED;
+        }
+
+        if (lctx.model.arch == LLM_ARCH_DEEPSEEK4 &&
+            std::getenv("IK_DSV4_FP") != nullptr) {
+            llama_dsv4_spec_ckpt_log_state(&lctx, "decode", lctx.kv_self.head + n_tokens,
+                    u_batch.token, (int32_t) u_batch.n_tokens, u_batch.pos);
         }
 
 #if IK_PRINT_TIMING
@@ -7898,10 +7923,6 @@ int32_t llama_lora_adapter_set(
             struct llama_context * ctx,
             struct llama_lora_adapter * adapter,
             float scale) {
-    if (ctx->cparams.flash_attn) {
-        LLAMA_LOG_ERROR("%s: flash_attn is not compatible with LoRA\n", __func__);
-        return -1;
-    }
     ctx->lora_adapters[adapter] = scale;
     return 0;
 }

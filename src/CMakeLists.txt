@@ -44,6 +44,7 @@ add_library(llama
             llama-spec-features-dflash.cpp
             llama-dflash.cpp
             llama-dsv4.cpp
+            dsv4_trace.cpp
             llama-vocab.cpp
             llama-grammar.cpp
             llama-sampling.cpp

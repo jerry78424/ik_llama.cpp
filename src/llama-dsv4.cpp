@@ -1,4 +1,5 @@
 #include "llama-dsv4.h"
+#include "dsv4_trace.h"
 
 #include <random>
 
@@ -12,6 +13,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <stdexcept>
@@ -835,6 +837,9 @@ static void dsv4_set_input_tensor(ggml_tensor * tensor, const std::vector<T> & v
     if (tensor == nullptr || tensor->buffer == nullptr || values.empty()) {
         return;
     }
+    if (tensor->name && (strstr(tensor->name, "raw_k_write_idxs") != nullptr || strstr(tensor->name, "raw_k_write_src_idxs") != nullptr)) {
+        dsv4_trace::emit_set_input(tensor, values.data(), values.size(), sizeof(T));
+    }
     ggml_backend_tensor_set(tensor, values.data(), 0, values.size()*sizeof(T));
 }
 
@@ -1455,6 +1460,7 @@ bool llama_dsv4_spec_ckpt_save(llama_context * ctx, bool use_gpu) {
             return false;
         }
         ckpt.dsv4_per_step_saved = true;
+        llama_dsv4_spec_ckpt_log_state(ctx, "save_per_step", ctx->kv_self.head);
         return true;
     }
 
@@ -1482,6 +1488,8 @@ bool llama_dsv4_spec_ckpt_save(llama_context * ctx, bool use_gpu) {
         saved.emplace_back(nbytes);
         ggml_backend_tensor_get(tensor, saved.back().data(), 0, nbytes);
     }
+
+    llama_dsv4_spec_ckpt_log_state(ctx, "save", ctx->kv_self.head);
 
     return true;
 }
@@ -1610,6 +1618,7 @@ enum llama_spec_ckpt_restore_result llama_dsv4_spec_ckpt_restore(llama_context *
         for (ggml_backend_t backend : backends) {
             ggml_backend_synchronize(backend);
         }
+        llama_dsv4_spec_ckpt_log_state(ctx, "restore_per_step", ctx->kv_self.head);
         return LLAMA_SPEC_CKPT_RESTORE_DIRECT;
     }
 
@@ -1645,6 +1654,8 @@ enum llama_spec_ckpt_restore_result llama_dsv4_spec_ckpt_restore(llama_context *
         }
     }
 
+    llama_dsv4_spec_ckpt_log_state(ctx, "restore_full", ctx->kv_self.head);
+
     return LLAMA_SPEC_CKPT_RESTORE_BASE_REPLAY_REQUIRED;
 }
 
@@ -1661,6 +1672,289 @@ ggml_tensor * llama_dsv4_spec_ckpt_delta(llama_context * ctx, ggml_tensor * stat
         }
     }
     return nullptr;
+}
+
+void llama_dsv4_spec_ckpt_log_state(llama_context * ctx, const char * tag, int64_t n_past, const llama_token * tokens, int32_t n_tokens, const llama_pos * positions) {
+    if (ctx == nullptr || ctx->model.arch != LLM_ARCH_DEEPSEEK4) {
+        return;
+    }
+    if (std::getenv("IK_DSV4_FP") == nullptr) {
+        return;
+    }
+
+    llama_synchronize(ctx);
+
+    auto fnv = [](uint64_t h, const void * data, size_t len) {
+        const uint8_t * p = (const uint8_t *) data;
+        for (size_t i = 0; i < len; ++i) {
+            h ^= p[i];
+            h *= 1099511628211ULL;
+        }
+        return h;
+    };
+
+    uint64_t h_state = 1469598103934665603ULL;
+    uint64_t h_comp  = 1469598103934665603ULL;
+    uint64_t h_raw   = 1469598103934665603ULL;
+
+    std::vector<uint8_t> buf;
+
+    const auto & cache = ctx->dsv4.cache;
+    const uint32_t n_stream = std::max<uint32_t>(1, cache.n_stream);
+
+    auto hash_group = [&](const std::vector<ggml_tensor *> & tensors, uint64_t & h) {
+        for (ggml_tensor * t : tensors) {
+            if (t == nullptr || t->buffer == nullptr) {
+                continue;
+            }
+            const size_t nbytes = ggml_nbytes(t);
+            buf.resize(nbytes);
+            ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
+            h = fnv(h, buf.data(), nbytes);
+        }
+    };
+
+    // the 6 checkpointed state tensors (what the restore touches)
+    hash_group(cache.csa_state_kv, h_state);
+    hash_group(cache.csa_state_score, h_state);
+    hash_group(cache.hca_state_kv, h_state);
+    hash_group(cache.hca_state_score, h_state);
+    hash_group(cache.lid_state_kv, h_state);
+    hash_group(cache.lid_state_score, h_state);
+
+    // compressed caches: rows written so far (row for boundary b is b / ratio)
+    const auto hash_comp_prefix = [&](const std::vector<ggml_tensor *> & tensors, uint32_t ratio, uint64_t & h) {
+        for (ggml_tensor * t : tensors) {
+            if (t == nullptr || t->buffer == nullptr) {
+                continue;
+            }
+            const int64_t n_written = n_past < 0 ? 0 : (int64_t) (n_past / ratio + 1);
+            const int64_t nrows = std::min<int64_t>(t->ne[1], n_written);
+            if (nrows <= 0) {
+                continue;
+            }
+            const size_t row_bytes = ggml_row_size(t->type, t->ne[0]);
+            buf.resize((size_t) nrows * row_bytes);
+            ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+            h = fnv(h, buf.data(), buf.size());
+        }
+    };
+
+    hash_comp_prefix(cache.csa_k, llama_context::dsv4_runtime::CSA_RATIO, h_comp);
+    hash_comp_prefix(cache.hca_k, llama_context::dsv4_runtime::HCA_RATIO, h_comp);
+    hash_comp_prefix(cache.lid_k, llama_context::dsv4_runtime::CSA_RATIO, h_comp);
+
+    // raw KV cells for the recent window (position -> cell mapping)
+    const auto & kv = ctx->kv_self;
+    const int64_t p0 = std::max<int64_t>(0, n_past - 4);
+    for (int64_t p = p0; p < n_past; ++p) {
+        for (size_t c = 0; c < kv.cells.size(); ++c) {
+            if (kv.cells[c].is_empty() || kv.cells[c].pos != p) {
+                continue;
+            }
+            for (size_t il = 0; il < kv.k_l.size(); ++il) {
+                const ggml_tensor * kt = kv.k_l[il];
+                if (kt != nullptr && kt->buffer != nullptr) {
+                    const size_t row_bytes = ggml_row_size(kt->type, kt->ne[0]);
+                    buf.resize(row_bytes);
+                    ggml_backend_tensor_get((ggml_tensor *) kt, buf.data(), (size_t) c * row_bytes, row_bytes);
+                    h_raw = fnv(h_raw, buf.data(), row_bytes);
+                }
+                if (il < kv.v_l.size()) {
+                    const ggml_tensor * vt = kv.v_l[il];
+                    if (vt != nullptr && vt->buffer != nullptr) {
+                        const size_t row_bytes = ggml_row_size(vt->type, vt->ne[0]);
+                        buf.resize(row_bytes);
+                        ggml_backend_tensor_get((ggml_tensor *) vt, buf.data(), (size_t) c * row_bytes, row_bytes);
+                        h_raw = fnv(h_raw, buf.data(), row_bytes);
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    // per-position persisted state slot hashes for the current batch
+    std::string pos_str;
+    if (tokens != nullptr && n_tokens > 0) {
+        const int64_t pos0 = std::max<int64_t>(0, n_past - n_tokens);
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            const llama_pos p = (llama_pos) (pos0 + i);
+            uint64_t h_pos = 1469598103934665603ULL;
+            char part[64];
+            // hash the raw K/V cell for this position (the row the batch graph writes for p)
+            {
+                uint64_t h_cell = 1469598103934665603ULL;
+                std::string layers_str;
+                for (size_t c = 0; c < kv.cells.size(); ++c) {
+                    if (kv.cells[c].is_empty() || kv.cells[c].pos != p) {
+                        continue;
+                    }
+                    for (size_t il = 0; il < kv.k_l.size(); ++il) {
+                        uint64_t h_il = 1469598103934665603ULL;
+                        uint64_t h_k_cell = 1469598103934665603ULL;
+                        uint64_t h_v_cell = 1469598103934665603ULL;
+                        const ggml_tensor * kt = kv.k_l[il];
+                        if (kt != nullptr && kt->buffer != nullptr) {
+                            const size_t row_bytes = ggml_row_size(kt->type, kt->ne[0]);
+                            buf.resize(row_bytes);
+                            ggml_backend_tensor_get((ggml_tensor *) kt, buf.data(), (size_t) c * row_bytes, row_bytes);
+                            h_cell = fnv(h_cell, buf.data(), row_bytes);
+                            h_il = fnv(h_il, buf.data(), row_bytes);
+                            h_k_cell = fnv(h_k_cell, buf.data(), row_bytes);
+                        }
+                        if (il < kv.v_l.size()) {
+                            const ggml_tensor * vt = kv.v_l[il];
+                            if (vt != nullptr && vt->buffer != nullptr) {
+                                const size_t row_bytes = ggml_row_size(vt->type, vt->ne[0]);
+                                buf.resize(row_bytes);
+                                ggml_backend_tensor_get((ggml_tensor *) vt, buf.data(), (size_t) c * row_bytes, row_bytes);
+                                h_cell = fnv(h_cell, buf.data(), row_bytes);
+                                h_il = fnv(h_il, buf.data(), row_bytes);
+                                h_v_cell = fnv(h_v_cell, buf.data(), row_bytes);
+                            }
+                        }
+                        snprintf(part, sizeof(part), "%sl%zu:%016llx", layers_str.empty() ? "" : ",", il, (unsigned long long) h_il);
+                        layers_str += part;
+                        if (il == 0) {
+                            uint64_t h_k_swa = 1469598103934665603ULL;
+                            char part2[192];
+                            const uint64_t swa_row = (uint64_t) kv.sink_rows + (uint64_t) (p - kv.pos_base_swa);
+                            if (kt != nullptr && kt->buffer != nullptr && swa_row < (uint64_t) kt->ne[1]) {
+                                const size_t row_bytes = ggml_row_size(kt->type, kt->ne[0]);
+                                buf.resize(row_bytes);
+                                ggml_backend_tensor_get((ggml_tensor *) kt, buf.data(), (size_t) swa_row * row_bytes, row_bytes);
+                                h_k_swa = fnv(h_k_swa, buf.data(), row_bytes);
+                            }
+                            snprintf(part2, sizeof(part2), ",k0:%016llx,v0:%016llx,k0swa:%016llx,swa0:%llu,c:%zu",
+                                    (unsigned long long) h_k_cell, (unsigned long long) h_v_cell,
+                                    (unsigned long long) h_k_swa, (unsigned long long) swa_row, c);
+                            layers_str += part2;
+                        }
+                    }
+                    break;
+                }
+                snprintf(part, sizeof(part), "%scell%lld:%016llx", pos_str.empty() ? "" : ",", (long long) p, (unsigned long long) h_cell);
+                pos_str += part;
+                pos_str += "{";
+                pos_str += layers_str;
+                pos_str += "}";
+            }
+            {
+                char part2[1024];
+                const auto & rw = ctx->dsv4.raw;
+                int wdi0 = rw.write_dst_idxs.size() > 0 ? rw.write_dst_idxs[0] : -1;
+                int wdi1 = rw.write_dst_idxs.size() > 1 ? rw.write_dst_idxs[1] : -1;
+                int wsi0 = rw.write_src_idxs.size() > 0 ? rw.write_src_idxs[0] : -1;
+                int tidx0 = -2, tidx1 = -2, tidx2 = -2;
+                ggml_tensor * wt = ctx->dsv4.inputs.raw_k_write_idxs;
+                if (wt != nullptr && wt->buffer != nullptr && wt->type == GGML_TYPE_I32) {
+                    std::vector<int32_t> tbuf((size_t) std::min<int64_t>(3, wt->ne[0]));
+                    ggml_backend_tensor_get(wt, tbuf.data(), 0, tbuf.size()*sizeof(int32_t));
+                    tidx0 = tbuf.size() > 0 ? tbuf[0] : -2;
+                    tidx1 = tbuf.size() > 1 ? tbuf[1] : -2;
+                    tidx2 = tbuf.size() > 2 ? tbuf[2] : -2;
+                }
+                snprintf(part2, sizeof(part2), "|h:%u,hs:%u,sink:%u,pbs:%lld,r0:%lld,wdi:%d,%d,wsi0:%d,tidx:%d,%d,%d",
+                        (unsigned) kv.head, (unsigned) kv.head_swa, (unsigned) kv.sink_rows,
+                        (long long) kv.pos_base_swa, (long long) kv.rows(0), wdi0, wdi1, wsi0,
+                        tidx0, tidx1, tidx2);
+                pos_str += part2;
+            }
+            // hash the raw K/V cells position p's attention can see (cells with pos <= p)
+            {
+                uint64_t h_view = 1469598103934665603ULL;
+                for (size_t c = 0; c < kv.cells.size(); ++c) {
+                    if (kv.cells[c].is_empty() || kv.cells[c].pos < 0 || kv.cells[c].pos > p) {
+                        continue;
+                    }
+                    for (size_t il = 0; il < kv.k_l.size(); ++il) {
+                        const ggml_tensor * kt = kv.k_l[il];
+                        if (kt != nullptr && kt->buffer != nullptr) {
+                            const size_t row_bytes = ggml_row_size(kt->type, kt->ne[0]);
+                            buf.resize(row_bytes);
+                            ggml_backend_tensor_get((ggml_tensor *) kt, buf.data(), (size_t) c * row_bytes, row_bytes);
+                            h_view = fnv(h_view, buf.data(), row_bytes);
+                        }
+                        if (il < kv.v_l.size()) {
+                            const ggml_tensor * vt = kv.v_l[il];
+                            if (vt != nullptr && vt->buffer != nullptr) {
+                                const size_t row_bytes = ggml_row_size(vt->type, vt->ne[0]);
+                                buf.resize(row_bytes);
+                                ggml_backend_tensor_get((ggml_tensor *) vt, buf.data(), (size_t) c * row_bytes, row_bytes);
+                                h_view = fnv(h_view, buf.data(), row_bytes);
+                            }
+                        }
+                    }
+                }
+                snprintf(part, sizeof(part), "%sview%lld:%016llx", pos_str.empty() ? "" : ",", (long long) p, (unsigned long long) h_view);
+                pos_str += part;
+            }
+            const auto hash_pos_group = [&](const std::vector<ggml_tensor *> & tensors, uint32_t state_size) {
+                for (ggml_tensor * t : tensors) {
+                    if (t == nullptr || t->buffer == nullptr) {
+                        continue;
+                    }
+                    const uint32_t state_size_stream = std::max<uint32_t>(1, state_size/n_stream);
+                    for (uint32_t s = 0; s < n_stream; ++s) {
+                        const int32_t row = (int32_t) (s*state_size_stream + (p % state_size_stream));
+                        if (row < 0 || row >= t->ne[1]) {
+                            continue;
+                        }
+                        const size_t row_bytes = ggml_row_size(t->type, t->ne[0]);
+                        buf.resize(row_bytes);
+                        ggml_backend_tensor_get(t, buf.data(), (size_t) row * row_bytes, row_bytes);
+                        h_pos = fnv(h_pos, buf.data(), row_bytes);
+                    }
+                }
+            };
+            const auto state_size_of = [&](const std::vector<ggml_tensor *> & tensors) {
+                for (const ggml_tensor * t : tensors) {
+                    if (t != nullptr) {
+                        return (uint32_t) t->ne[1];
+                    }
+                }
+                return (uint32_t) 0;
+            };
+            const uint32_t csa_state_size = state_size_of(cache.csa_state_kv);
+            const uint32_t hca_state_size = state_size_of(cache.hca_state_kv);
+            const uint32_t lid_state_size = state_size_of(cache.lid_state_kv);
+            hash_pos_group(cache.csa_state_kv, csa_state_size);
+            hash_pos_group(cache.csa_state_score, csa_state_size);
+            hash_pos_group(cache.hca_state_kv, hca_state_size);
+            hash_pos_group(cache.hca_state_score, hca_state_size);
+            hash_pos_group(cache.lid_state_kv, lid_state_size);
+            hash_pos_group(cache.lid_state_score, lid_state_size);
+            snprintf(part, sizeof(part), "%s%d:%016llx", pos_str.empty() ? "" : ",", (int) p, (unsigned long long) h_pos);
+            pos_str += part;
+        }
+    }
+
+    // Build the per-position state-slot hash string (already computed above).
+    std::string tok_str, posn_str;
+    if (tokens != nullptr && n_tokens > 0) {
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            char b[32];
+            snprintf(b, sizeof(b), "%s%d", i == 0 ? "" : ",", tokens[i]);
+            tok_str += b;
+        }
+    } else {
+        tok_str = "-";
+    }
+    if (positions != nullptr && n_tokens > 0) {
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            char b[32];
+            snprintf(b, sizeof(b), "%s%lld", i == 0 ? "" : ",", (long long) positions[i]);
+            posn_str += b;
+        }
+    } else {
+        posn_str = "-";
+    }
+
+    dsv4_trace::emit("state", "\"tag\":\"%s\",\"n_past\":%lld,\"state\":%016llx,\"comp\":%016llx,\"raw\":%016llx,\"pos\":\"%s\",\"tok\":[%s],\"posn\":[%s]",
+            tag, (long long) n_past, (unsigned long long) h_state,
+            (unsigned long long) h_comp, (unsigned long long) h_raw,
+            pos_str.empty() ? "-" : pos_str.c_str(), tok_str.c_str(), posn_str.c_str());
 }
 
 void llama_dsv4_spec_ckpt_record_plan(llama_context * ctx) {
