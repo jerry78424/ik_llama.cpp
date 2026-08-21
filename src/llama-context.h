@@ -726,4 +726,16 @@ struct llama_context {
     void set_mtp_n_heads(int32_t value);
 
     int max_nodes(int n_tokens, int n_kv) const;
+
+    // DSpark confidence head values (sigmoid, one per draft position), read
+    // back from the graph after each decode. Empty when the draft model has no
+    // confidence head or the graph did not produce one.
+    //
+    // NOTE: deliberately tail-placed in llama_context, NOT inside dflash_runtime.
+    // Growing any mid-class struct shifts swa_window_view and neighbours into the
+    // blast zone of a pre-existing forward out-of-bounds write (server then dies
+    // at build_deepseek4.cpp:1094, swa_window_view assert). Tail placement keeps
+    // every existing member offset unchanged. See porting_verification.md case study.
+    std::vector<float> dspark_conf_values;
+    struct ggml_tensor * dspark_conf_tensor = nullptr;
 };

@@ -316,11 +316,16 @@ struct common_speculative_state_dflash : public common_speculative_state {
             return;
         }
 
-        const int32_t max_draft_tokens = is_dsv4_dspark ? query_capacity : (is_dspark ? block_size : block_size - 1);
+       const int32_t max_draft_tokens = is_dsv4_dspark ? query_capacity : (is_dspark ? block_size : block_size - 1);
         if (is_dsv4_dspark && params.n_max > query_capacity) {
             LOG_ERR("%s: DSV4 DSpark runtime width %d exceeds allocated query capacity %d\n",
                     __func__, params.n_max, query_capacity);
             return;
+        }
+        const int32_t n_min = std::min<int32_t>(params.n_min, max_draft_tokens);
+        if (!is_dsv4_dspark && (params.n_max > max_draft_tokens || params.n_min > max_draft_tokens)) {
+            LOG_WRN("%s: requested draft size (n_max=%d, n_min=%d) exceeds the trained DFlash block size %d -- clamping to %d\n",
+                    __func__, params.n_max, params.n_min, block_size, max_draft_tokens);
         }
         const int32_t n_keep = is_dsv4_dspark
                 ? params.n_max
@@ -460,12 +465,38 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         result.reserve((size_t) n_keep);
         for (int32_t i = 0; i < n_keep; ++i) {
+            const int32_t logits_idx = is_dspark ? i : i + 1;
             llama_token id = llama_get_dflash_draft_token_ith(ctx_dft, i);
             if (id == LLAMA_TOKEN_NULL) {
-                const int32_t logits_idx = is_dspark ? i : i + 1;
-                id = common_sampler_sample_speculative(nullptr, ctx_dft, logits_idx, nullptr);
+                // Fallback: no argmax tensor slot; sample from logits directly.
+                // spec-draft-p-min applies here on real softmax probabilities.
+                float prob = 0.0f;
+                id = common_sampler_sample_speculative(nullptr, ctx_dft, logits_idx,
+                        params.p_min > 0.0f ? &prob : nullptr);
+                if (params.p_min > 0.0f && prob < params.p_min) {
+                    break;
+                }
+            } else if (params.p_min_explicit && params.p_min > 0.0f && is_dspark) {
+                // spec-draft-p-min: gate each drafted token on the DSpark
+                // confidence head. The draft context intentionally skips logits
+                // export (llama.cpp: dflash_skip_logits), so softmax probabilities
+                // are unavailable here; the in-graph sigmoid confidence is the
+                // matching per-position signal. Plain DFlash drafts have no
+                // confidence head, so p_min cannot be applied on that path.
+                // Requires an EXPLICIT stage override (--spec-type
+                // dspark:p_min=...): the legacy 0.75 default predates the conf
+                // head and would silently disable all drafting otherwise.
+                const float conf = llama_get_dflash_dspark_conf_ith(ctx_dft, i);
+                if (conf >= 0.0f && conf < params.p_min) {
+                    break;
+                }
             }
             result.push_back(id);
+        }
+
+       // spec-draft-n-min: a draft shorter than n_min is discarded entirely.
+        if (result.size() < (size_t) n_min) {
+            result.clear();
         }
 
         generated_tokens += (uint64_t) result.size();

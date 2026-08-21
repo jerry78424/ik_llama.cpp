@@ -1671,6 +1671,7 @@ ggml_cgraph * llm_build_context::build_dflash_dsv4() {
     ggml_build_forward_expand(gf, out);
 
     lctx.dflash.draft_tokens_tensor = nullptr;
+    lctx.dspark_conf_tensor = nullptr;
     ggml_tensor * draft_tokens = nullptr;
     ggml_tensor * dspark_conf = nullptr;
     ggml_tensor * result = out;
@@ -1687,5 +1688,6 @@ ggml_cgraph * llm_build_context::build_dflash_dsv4() {
         ggml_build_forward_expand(gf, dspark_conf);
     }
     lctx.dflash.draft_tokens_tensor = draft_tokens;
+    lctx.dspark_conf_tensor = dspark_conf;
     return gf;
 }

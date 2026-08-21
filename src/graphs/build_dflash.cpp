@@ -781,6 +781,7 @@ ggml_cgraph * llm_build_context::build_dflash() {
         lctx.dflash.draft_lattice_top_k = (int32_t) top_k;
     }
 
+    lctx.dspark_conf_tensor = nullptr;
     ggml_tensor * draft_tokens = nullptr;
     ggml_tensor * dspark_conf = nullptr;
     if (lctx.dflash.dspark) {
@@ -796,6 +797,7 @@ ggml_cgraph * llm_build_context::build_dflash() {
         ggml_build_forward_expand(gf, dspark_conf);
     }
     lctx.dflash.draft_tokens_tensor = draft_tokens;
+    lctx.dspark_conf_tensor = dspark_conf;
 
     return gf;
 }

@@ -6991,7 +6991,7 @@ static int llama_decode_internal(
             }
         }
 
-        if (lctx.model.arch == LLM_ARCH_DFLASH2 && lctx.dflash.draft_lattice_tensor != nullptr &&
+       if (lctx.model.arch == LLM_ARCH_DFLASH2 && lctx.dflash.draft_lattice_tensor != nullptr &&
                 lctx.dflash.draft_lattice_ids_tensor != nullptr) {
             ggml_backend_t backend_lattice = ggml_backend_sched_get_tensor_backend(
                     lctx.sched, lctx.dflash.draft_lattice_tensor);
@@ -7035,6 +7035,20 @@ static int llama_decode_internal(
                 if (!selected.empty()) {
                     lctx.dflash.draft_tokens = std::move(selected);
                 }
+            }
+        }
+
+        lctx.dspark_conf_values.clear();
+        if (lctx.dspark_conf_tensor != nullptr) {
+            ggml_backend_t backend_conf = ggml_backend_sched_get_tensor_backend(
+                lctx.sched, lctx.dspark_conf_tensor);
+            if (backend_conf != nullptr) {
+                const int64_t n_conf = lctx.dspark_conf_tensor->ne[0] * lctx.dspark_conf_tensor->ne[1];
+                lctx.dspark_conf_values.resize((size_t) n_conf);
+                ggml_backend_tensor_get_async(backend_conf,
+                    lctx.dspark_conf_tensor,
+                    lctx.dspark_conf_values.data(), 0,
+                    (size_t) n_conf * sizeof(float));
             }
         }
 
@@ -12269,6 +12283,15 @@ bool llama_copy_dflash_draft_lattice(
     std::memcpy(scores, ctx->dflash.draft_lattice.data(), n_scores * sizeof(float));
     std::memcpy(ids, ctx->dflash.draft_lattice_ids.data(), n_ids * sizeof(int32_t));
     return true;
+}
+
+float llama_get_dflash_dspark_conf_ith(struct llama_context * ctx, int32_t i) {
+    llama_synchronize(ctx);
+
+    if ((size_t) i >= ctx->dspark_conf_values.size()) {
+        return -1.0f;
+    }
+    return ctx->dspark_conf_values[(size_t) i];
 }
 
 float * llama_get_embeddings(struct llama_context * ctx) {

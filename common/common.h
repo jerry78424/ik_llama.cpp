@@ -227,8 +227,13 @@ struct common_params_speculative {
     float    draft_temperature = 0.0f;
     uint32_t draft_seed = LLAMA_DEFAULT_SEED;
 
-    float   p_split = 0.1f; // speculative decoding split probability
+    float   p_split = 0.1f; // speculative decoding probability
     float   p_min = 0.75f; // minimum speculative decoding probability (greedy)
+    // true when the resolved p_min came from an explicit stage override
+    // (--spec-type <type>:p_min=...). The 0.75 default above predates the DSpark
+    // confidence head, whose values sit far below it, so consumers that gate on
+    // conf-head values must require this flag instead of firing on the default.
+    bool    p_min_explicit = false;
 
     // ngram-based speculative decoding
 
