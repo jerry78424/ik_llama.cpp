@@ -836,6 +836,14 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
         return false;
     }
 
+    // Wire the parsed verbosity into the log threshold so higher levels
+    // (--verbosity N, e.g. DBG) become visible via CLI. Previously this flag
+    // was parsed but never consumed anywhere, leaving LOG_DBG permanently
+    // suppressed regardless of the value passed.
+    if (params.verbosity > 0) {
+        common_log_set_verbosity_thold(LOG_DEFAULT_LLAMA + params.verbosity);
+    }
+
     return true;
 }
 
