@@ -2673,6 +2673,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
     size_t moe_next  = 0; // first moe_infos entry with split >= current split
     size_t moe_enq   = 0; // moe_infos entries already enqueued for lookahead
+    int prev_split_backend_id = -1;
 
     for (int i = 0; i < sched->n_splits; i++) {
 #if IK_PRINT_TIMING
@@ -2685,6 +2686,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         ggml_tensor * prefetch_input_cpy = NULL;
         ggml_backend_buffer_t prefetch_saved_buffer = NULL;
         void * prefetch_saved_data = NULL;
+
+        // [port] llama.cpp 849798132: ensure the previous split's async work has
+        // completed before this split runs when it has no inputs of its own -- the
+        // allocator may have reused buffer regions across splits.
+        if (split->n_inputs == 0 && prev_split_backend_id >= 0 && prev_split_backend_id != split_backend_id) {
+            if (sched->events[prev_split_backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_synchronize(sched->events[prev_split_backend_id][sched->cur_copy]);
+            } else {
+                ggml_backend_synchronize(sched->backends[prev_split_backend_id]);
+            }
+        }
 
         if (moe_prefetch && !moe_infos.empty()) {
             while (moe_next < moe_infos.size() && moe_infos[moe_next].split < i) {
@@ -2745,12 +2757,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // record the event of this copy
-        if (split->n_inputs > 0) {
-            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy]);
-            }
+        // [port] llama.cpp 849798132: record the event of this split (every
+        // split, not just ones with inputs, so a following empty-input split on
+        // another backend can synchronize against it).
+        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+            ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy]);
         }
+
+        prev_split_backend_id = split_backend_id;
     }
 
     sched->cur_copy = (sched->cur_copy + 1) % sched->n_copies;
