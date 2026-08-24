@@ -248,6 +248,17 @@ bool ggml_cuda_dsa_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     constexpr int k_max_rows = 32;
 
+    // Efficiency gate ratio, tunable for calibration. A/B measured on RTX 5090 /
+    // DSV4-Flash (see documents/verification-baseline/sweep-pp-dip-analysis.md):
+    // at ratio 2.78 DSA still beats the generic FA fallback by ~6-7% per window,
+    // so the historical 4x (and a naive 3x) reject prematurely and cause permanent
+    // prefill cliffs (~10% at padded nkv>=151556 with 4x). Default 2.0 keeps DSA
+    // engaged across the whole measurable range; the true crossover lies below 2.78.
+    static const float eff_ratio = [] {
+        const char * e = getenv("IK_DSA_EFF_RATIO");
+        return e ? (float) atof(e) : 2.0f;
+    }();
+
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
@@ -269,7 +280,7 @@ bool ggml_cuda_dsa_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         // and fall back to the generic FA path costing ~43 ms/launch on RTX 5090 - a
         // permanent ~10% prefill cliff. The gather path remains far cheaper than the
         // generic fallback down to a 3x ratio, so accept it there.
-        if (K->ne[1] < 3*indexer->ne[0]) return false; // for efficiency
+        if (K->ne[1] < eff_ratio*indexer->ne[0]) return false; // for efficiency
     }
     if (K->ne[2] > 1 || K->ne[3] > 1 || mask->ne[2] > 1 || mask->ne[3] > 1 || Q->ne[3] > 1) return false;
     if ((K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_Q8_0) ||
