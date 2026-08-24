@@ -19,11 +19,118 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
+#include <cstdarg>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
+
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
+
+// ---------------------------------------------------------------------------
+// Resident instrumentation (methodology-review.md §1.3 / §2.4 / §3.3).
+// Both helpers are env-gated and default OFF, so they stay in the tree without
+// touching benchmark numbers: set IK_SWEEP_DIAG=1 and/or IK_SWEEP_NVTX=1.
+// ---------------------------------------------------------------------------
+
+static bool sweep_env_flag(const char * name) {
+    const char * v = getenv(name);
+    return v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0;
+}
+
+// Normalized diag output: always stderr, prefixed, flushed. Sharing stdout with
+// jsonl rows caused block-buffered/interleaved streams that ruined timing
+// correlation twice during the DSV4 prefill investigation.
+static void sweep_diag(const char * fmt, ...) {
+    static const bool enabled = sweep_env_flag("IK_SWEEP_DIAG");
+    if (!enabled) {
+        return;
+    }
+    va_list args;
+    va_start(args, fmt);
+    fputs("[sweep-diag] ", stderr);
+    vfprintf(stderr, fmt, args);
+    fputc('\n', stderr);
+    fflush(stderr);
+    va_end(args);
+}
+
+static long long sweep_wall_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+#if defined(_WIN32)
+using nvtx_range_push_fn = int (__stdcall *)(const char *);
+using nvtx_range_pop_fn  = int (__stdcall *)();
+#else
+using nvtx_range_push_fn = int (*)(const char *);
+using nvtx_range_pop_fn  = int (*)();
+#endif
+
+struct sweep_nvtx {
+    nvtx_range_push_fn push = nullptr;
+    nvtx_range_pop_fn  pop  = nullptr;
+
+    // Dynamically loaded: no link-time dependency, silently inert when the NVTX
+    // runtime (e.g. nsight systems host) is absent.
+    void init() {
+        static const bool enabled = sweep_env_flag("IK_SWEEP_NVTX");
+        if (!enabled) {
+            return;
+        }
+#ifdef _WIN32
+        HMODULE lib = LoadLibraryA("nvtx64.dll");
+        if (lib == nullptr) {
+            lib = LoadLibraryA("nvToolsExt64_1.dll");
+        }
+        if (lib != nullptr) {
+            push = reinterpret_cast<nvtx_range_push_fn>(GetProcAddress(lib, "nvtxRangePushA"));
+            pop  = reinterpret_cast<nvtx_range_pop_fn>(GetProcAddress(lib, "nvtxRangePop"));
+        }
+#else
+        void * lib = dlopen("libnvToolsExt.so", RTLD_LAZY);
+        if (lib == nullptr) {
+            lib = dlopen("libnvtx.so", RTLD_LAZY);
+        }
+        if (lib != nullptr) {
+            push = reinterpret_cast<nvtx_range_push_fn>(dlsym(lib, "nvtxRangePushA"));
+            pop  = reinterpret_cast<nvtx_range_pop_fn>(dlsym(lib, "nvtxRangePop"));
+        }
+#endif
+        if (push == nullptr || pop == nullptr) {
+            sweep_diag("IK_SWEEP_NVTX=1 but no nvtx runtime found; running without ranges");
+        } else {
+            sweep_diag("NVTX ranges enabled");
+        }
+    }
+
+    void range(const char * label) {
+        if (push != nullptr) {
+            push(label);
+        }
+    }
+
+    void end() {
+        if (pop != nullptr) {
+            pop();
+        }
+    }
+};
+
+static double sweep_median_us(std::vector<int64_t> samples) {
+    if (samples.empty()) {
+        return 0.0;
+    }
+    std::sort(samples.begin(), samples.end());
+    const size_t n = samples.size();
+    return n % 2 == 1 ? (double) samples[n / 2]
+                      : ((double) samples[n / 2 - 1] + (double) samples[n / 2]) / 2.0;
+}
 
 static double get_rss_hwm_mib() {
 #ifdef _WIN32
@@ -129,9 +236,13 @@ static void print_usage(int argc, char ** argv) {
     gpt_params_print_usage(argc, argv, params);
 
     LOG_TEE("\nsweep-bench specific options:\n\n");
-    LOG_TEE("  -nrep, --n-repetitions N        number of repetitions for each context size (default: 1)\n");
+    LOG_TEE("  -nrep, --n-repetitions N        repetitions per measured row, reported as median (default: 1)\n");
     LOG_TEE("         --sweep-stride N         measure every Nth sweep row (default: 1)\n");
+    LOG_TEE("         --sweep-start N          fast-fill windows below KV position N without timing\n");
     LOG_TEE("         --sweep-memory           report RSS high-water and sampled VRAM delta\n");
+    LOG_TEE("\nenvironment switches (default off, resident instrumentation):\n");
+    LOG_TEE("  IK_SWEEP_DIAG=1                 stderr diag lines, prefixed and flushed\n");
+    LOG_TEE("  IK_SWEEP_NVTX=1                 NVTX ranges W<i> per measured window, FILL@<n_kv> while fast-filling\n");
     LOG_TEE("  -wb,   --warmup-batch           run a warmup batch before measurement\n");
     LOG_TEE("         --output-format FORMAT    output format: table (default) or jsonl\n");
     LOG_TEE("\nexample usage:\n");
@@ -285,13 +396,35 @@ int main(int argc, char ** argv) {
 
     int i_loop = 0;
     std::vector<uint8_t> checkpoint_data;
+    sweep_nvtx nvtx;
+    nvtx.init();
 
     for (unsigned int n_kv = 0; n_kv < n_kv_max; n_kv += params.n_ubatch) {
         // clean up KV cache before generation
         //llama_kv_cache_seq_rm(ctx, 0, n_kv, -1);
 
+        // --sweep-start: windows strictly below this KV position are fast-filled
+        // with a single unmeasured prefill pass, so tail-segment experiments no
+        // longer pay full measurement cost over the lower half of the context.
+        // The KV state left behind is identical to a normal stride-1 run at this
+        // boundary, so measured rows stay comparable to full sweeps.
+        if (params.sweep_start > 0 && n_kv < params.sweep_start) {
+            char label[32];
+            snprintf(label, sizeof(label), "FILL@%u", n_kv);
+            nvtx.range(label);
+            sweep_diag("fill window %d n_kv=%u (below --sweep-start %u)", i_loop, n_kv, params.sweep_start);
+            common_batch_clear(batch);
+            if (!pp_helper(n_kv)) {
+                LOG_TEE("%s: llama_decode() failed\n", __func__);
+                return 1;
+            }
+            nvtx.end();
+            ++i_loop;
+            continue;
+        }
+
         const bool measure = i_loop % params.sweep_stride == 0;
-        int nrep = measure && i_loop < 1 ? params.nrep : 1;
+        int nrep = measure ? std::max(1, params.nrep) : 1;
 
         size_t checkpoint_size = 0;
         if (use_checkpoint && measure && n_kv > 0) {
@@ -306,15 +439,19 @@ int main(int argc, char ** argv) {
         }
 
         // first measure token generation performance at this context size
-        int64_t t_tg_start = 0;
-        int64_t t_tg_end   = 0;
+        std::vector<int64_t> rep_tg;
+        std::vector<int64_t> rep_pp;
 
         if (measure) {
-            t_tg_start = ggml_time_us();
-            //fprintf(stderr, "======================================== tg_start for n_kv = %u\n", n_kv);
-            //printf("======================================== tg_start for n_kv = %u\n", n_kv);
+            char label[32];
+            snprintf(label, sizeof(label), "W%d", i_loop);
+            nvtx.range(label);
+            sweep_diag("window %d n_kv=%u nrep=%d tg begin", i_loop, n_kv, nrep);
 
+            rep_tg.reserve(nrep);
             for (int irep = 0; irep < nrep; ++irep) {
+                const int64_t rep_start = ggml_time_us();
+
                 if (use_checkpoint) {
                     if (n_kv == 0) {
                         llama_kv_cache_clear(ctx);
@@ -332,11 +469,12 @@ int main(int argc, char ** argv) {
                         return 1;
                     }
                 }
+
+                rep_tg.push_back(ggml_time_us() - rep_start);
             }
 
-            //fprintf(stderr, "======================================== tg_end for n_kv = %u\n", n_kv);
-            //printf("======================================== tg_end for n_kv = %u\n", n_kv);
-            t_tg_end = ggml_time_us();
+            sweep_diag("window %d n_kv=%u tg end (median %.3fs of %d reps)", i_loop, n_kv,
+                       sweep_median_us(rep_tg) / 1e6, nrep);
         } else {
             // keep the token stream aligned with a stride-1 sweep
             for (unsigned int i = 0; i < tg; ++i) {
@@ -357,13 +495,11 @@ int main(int argc, char ** argv) {
         }
 
         // measure prompt processing performance
-        int64_t t_pp_start = 0;
-        int64_t t_pp_end   = 0;
-
         if (measure) {
-            t_pp_start = ggml_time_us();
-
+            rep_pp.reserve(nrep);
             for (int irep = 0; irep < nrep; ++irep) {
+                const int64_t rep_start = ggml_time_us();
+
                 if (use_checkpoint) {
                     if (n_kv == 0) {
                         llama_kv_cache_clear(ctx);
@@ -379,9 +515,12 @@ int main(int argc, char ** argv) {
                     LOG_TEE("%s: llama_decode() failed\n", __func__);
                     return 1;
                 }
+
+                rep_pp.push_back(ggml_time_us() - rep_start);
             }
 
-            t_pp_end = ggml_time_us();
+            sweep_diag("window %d n_kv=%u pp end (median %.3fs of %d reps)", i_loop, n_kv,
+                       sweep_median_us(rep_pp) / 1e6, nrep);
         } else {
             if (!pp_helper(n_kv)) {
                 LOG_TEE("%s: llama_decode() failed\n", __func__);
@@ -394,12 +533,13 @@ int main(int argc, char ** argv) {
             continue;
         }
 
-        // calculate and print metrics
-        const float t_pp = (t_pp_end - t_pp_start) / 1000000.0f / nrep;
-        const float t_tg = (t_tg_end - t_tg_start) / 1000000.0f / nrep;
+        // calculate and print metrics (median across reps: single-shot samples
+        // put ±1-2% noise straight into the curve and mask small steps)
+        const double t_pp = sweep_median_us(rep_pp) / 1e6;
+        const double t_tg = sweep_median_us(rep_tg) / 1e6;
 
-        const float speed_pp = pp / t_pp;
-        const float speed_tg = tg / t_tg;
+        const double speed_pp = pp / t_pp;
+        const double speed_tg = tg / t_tg;
 
         double rss_hwm_mib    = -1.0;
         double vram_delta_mib = -1.0;
@@ -414,16 +554,16 @@ int main(int argc, char ** argv) {
                 const std::string vram_json = format_mib(vram_delta_mib, 3, "null");
                 LOG_TEE(
                     "{\"n_kv_max\": %d, \"n_batch\": %d, \"n_ubatch\": %d, \"flash_attn\": %d, \"n_gpu_layers\": %d, \"n_threads\": %u, \"n_threads_batch\": %u, "
-                    "\"pp\": %d, \"tg\": %d, \"n_kv\": %d, \"t_pp\": %f, \"speed_pp\": %f, \"t_tg\": %f, \"speed_tg\": %f, \"rss_hwm_mib\": %s, \"vram_delta_mib\": %s }\n",
+                    "\"win\": %d, \"ts\": %lld, \"pp\": %d, \"tg\": %d, \"n_kv\": %d, \"t_pp\": %f, \"speed_pp\": %f, \"t_tg\": %f, \"speed_tg\": %f, \"rss_hwm_mib\": %s, \"vram_delta_mib\": %s }\n",
                     n_kv_max, params.n_batch, params.n_ubatch, params.flash_attn, params.n_gpu_layers, ctx_params.n_threads, ctx_params.n_threads_batch,
-                    pp, tg, n_kv, t_pp, speed_pp, t_tg, speed_tg, rss_json.c_str(), vram_json.c_str()
+                    i_loop, sweep_wall_ms(), pp, tg, n_kv, t_pp, speed_pp, t_tg, speed_tg, rss_json.c_str(), vram_json.c_str()
                 );
             } else {
                 LOG_TEE(
                     "{\"n_kv_max\": %d, \"n_batch\": %d, \"n_ubatch\": %d, \"flash_attn\": %d, \"n_gpu_layers\": %d, \"n_threads\": %u, \"n_threads_batch\": %u, "
-                    "\"pp\": %d, \"tg\": %d, \"n_kv\": %d, \"t_pp\": %f, \"speed_pp\": %f, \"t_tg\": %f, \"speed_tg\": %f }\n",
+                    "\"win\": %d, \"ts\": %lld, \"pp\": %d, \"tg\": %d, \"n_kv\": %d, \"t_pp\": %f, \"speed_pp\": %f, \"t_tg\": %f, \"speed_tg\": %f }\n",
                     n_kv_max, params.n_batch, params.n_ubatch, params.flash_attn, params.n_gpu_layers, ctx_params.n_threads, ctx_params.n_threads_batch,
-                    pp, tg, n_kv, t_pp, speed_pp, t_tg, speed_tg
+                    i_loop, sweep_wall_ms(), pp, tg, n_kv, t_pp, speed_pp, t_tg, speed_tg
                 );
             }
         } else {
@@ -435,6 +575,9 @@ int main(int argc, char ** argv) {
                 LOG_TEE("|%6d | %6d | %6d | %8.3f | %8.2f | %8.3f | %8.2f |\n", pp, tg, n_kv, t_pp, speed_pp, t_tg, speed_tg);
             }
         }
+
+        sweep_diag("window %d n_kv=%u done: speed_pp=%.1f t/s speed_tg=%.1f t/s", i_loop, n_kv, speed_pp, speed_tg);
+        nvtx.end();
 
         ++i_loop;
     }

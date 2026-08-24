@@ -329,6 +329,7 @@ struct gpt_params {
     int32_t max_extra_alloc_MiB   =     256; // additional VRAM per GPU the scheduler may allocate for more efficient compute graph evaluation
     int32_t nrep                  =       1; // number of repetitions used in sweep bench
     int32_t sweep_stride          =       1;
+    uint32_t sweep_start          =       0; // start measuring from this KV position (windows below are fast-filled)
     bool    sweep_memory          =   false;
     bool    sweep_bench           =   false;
 

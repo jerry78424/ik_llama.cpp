@@ -1360,6 +1360,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.sweep_stride = std::stoi(argv[i]);
         return true;
     }
+    if (params.sweep_bench && arg == "--sweep-start") {
+        CHECK_ARG
+        params.sweep_start = std::stoul(argv[i]);
+        return true;
+    }
     if (params.sweep_bench && arg == "--sweep-memory") {
         params.sweep_memory = true;
         return true;
@@ -3428,6 +3433,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "bench",       "-nrep,  --n-repetitions N",     "number of repetitions (default: %d)", params.nrep });
     if (params.sweep_bench) {
         options.push_back({ "bench",   "        --sweep-stride N",       "measure every Nth sweep row (default: %d)", params.sweep_stride });
+        options.push_back({ "bench",   "        --sweep-start N",       "start measuring from KV position N; windows below are fast-filled without timing (default: %d)", params.sweep_start });
         options.push_back({ "bench",   "        --sweep-memory",         "report RSS high-water and sampled VRAM delta" });
     }
     options.push_back({ "bench",       "-wb,    --warmup-batch",         "run a warmup batch before measurement" });
