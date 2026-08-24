@@ -31,6 +31,8 @@
 #include <dlfcn.h>
 #endif
 
+#include <cinttypes>
+
 // ---------------------------------------------------------------------------
 // Resident instrumentation (methodology-review.md §1.3 / §2.4 / §3.3).
 // Both helpers are env-gated and default OFF, so they stay in the tree without
@@ -42,26 +44,44 @@ static bool sweep_env_flag(const char * name) {
     return v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0;
 }
 
-// Normalized diag output: always stderr, prefixed, flushed. Sharing stdout with
-// jsonl rows caused block-buffered/interleaved streams that ruined timing
-// correlation twice during the DSV4 prefill investigation.
-static void sweep_diag(const char * fmt, ...) {
-    static const bool enabled = sweep_env_flag("IK_SWEEP_DIAG");
-    if (!enabled) {
-        return;
-    }
-    va_list args;
-    va_start(args, fmt);
-    fputs("[sweep-diag] ", stderr);
-    vfprintf(stderr, fmt, args);
-    fputc('\n', stderr);
-    fflush(stderr);
-    va_end(args);
-}
-
 static long long sweep_wall_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// Normalized diag output: always prefixed and flushed. Default target is
+// stderr (stdout sharing caused block-buffered interleaving twice during the
+// DSV4 investigation); setting IK_SWEEP_DIAG_FILE=<path> additionally appends
+// to a dedicated file - profilers like nsys swallow child stdio, so the file
+// is the reliable channel for correlating windows with a capture.
+static void sweep_diag(const char * fmt, ...) {
+    static const bool enabled = sweep_env_flag("IK_SWEEP_DIAG");
+    static FILE * diag_file = []() -> FILE * {
+        const char * p = getenv("IK_SWEEP_DIAG_FILE");
+        return (p != nullptr && p[0] != '\0') ? fopen(p, "a") : nullptr;
+    }();
+    if (!enabled && diag_file == nullptr) {
+        return;
+    }
+    char buf[512];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    // wall-clock epoch ms lets diag lines be aligned against profiler timelines
+    // (nsys --delay/--duration windows) and manager log rows ("ts" field)
+    char line[560];
+    snprintf(line, sizeof(line), "[%" PRId64 "] %s", (int64_t) sweep_wall_ms() , buf);
+    if (enabled) {
+        fputs("[sweep-diag] ", stderr);
+        fputs(line, stderr);
+        fputc('\n', stderr);
+        fflush(stderr);
+    }
+    if (diag_file != nullptr) {
+        fprintf(diag_file, "[sweep-diag] %s\n", line);
+        fflush(diag_file);
+    }
 }
 
 #if defined(_WIN32)
@@ -242,6 +262,7 @@ static void print_usage(int argc, char ** argv) {
     LOG_TEE("         --sweep-memory           report RSS high-water and sampled VRAM delta\n");
     LOG_TEE("\nenvironment switches (default off, resident instrumentation):\n");
     LOG_TEE("  IK_SWEEP_DIAG=1                 stderr diag lines, prefixed and flushed\n");
+    LOG_TEE("  IK_SWEEP_DIAG_FILE=PATH         additionally append diag lines to this file\n");
     LOG_TEE("  IK_SWEEP_NVTX=1                 NVTX ranges W<i> per measured window, FILL@<n_kv> while fast-filling\n");
     LOG_TEE("  -wb,   --warmup-batch           run a warmup batch before measurement\n");
     LOG_TEE("         --output-format FORMAT    output format: table (default) or jsonl\n");
@@ -261,6 +282,11 @@ int main(int argc, char ** argv) {
     }
     if (params.nrep < 1) params.nrep = 1;
     if (params.sweep_stride < 1) params.sweep_stride = 1;
+
+    // init instrumentation before any heavy work so the "ranges enabled / no
+    // nvtx runtime" diag line is visible within seconds of a bad launch
+    sweep_nvtx nvtx;
+    nvtx.init();
 
     if (params.minilog) {
         llama_log_set(llama_selective_log_callback, nullptr);
@@ -396,8 +422,6 @@ int main(int argc, char ** argv) {
 
     int i_loop = 0;
     std::vector<uint8_t> checkpoint_data;
-    sweep_nvtx nvtx;
-    nvtx.init();
 
     for (unsigned int n_kv = 0; n_kv < n_kv_max; n_kv += params.n_ubatch) {
         // clean up KV cache before generation
