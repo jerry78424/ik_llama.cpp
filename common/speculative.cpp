@@ -1336,6 +1336,22 @@ common_speculative * common_speculative_init(
 
         llama_context_params cparams_dft = params.cparams_dft;
 
+        // ported from mihailescu2m/llama.cpp 2b796c2cd: the draft context would
+        // inherit batch sizes meant for the target (or library defaults of
+        // 2048), but a drafter submits at most n_seq*(n_max+1) tokens per step,
+        // and the classic-draft resync path is bounded by the draft's own
+        // n_ctx (512) minus n_max. A DFlash/DSpark drafter is an MoE model, so
+        // compute buffers sized for large batches cost real VRAM for nothing.
+        {
+            const uint32_t n_batch_dft = 512;
+            if (cparams_dft.n_batch > n_batch_dft) {
+                cparams_dft.n_batch = n_batch_dft;
+            }
+            if (cparams_dft.n_ubatch > n_batch_dft) {
+                cparams_dft.n_ubatch = n_batch_dft;
+            }
+        }
+
         if (has_dflash_stage) {
             if (!llama_model_share_dflash_io_tensors(params.model_dft, llama_get_model(ctx_tgt))) {
                 LOG_ERR("%s: failed to share target IO tensors with DFlash draft model\n", __func__);
