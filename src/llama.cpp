@@ -7911,8 +7911,12 @@ static void llama_lora_adapter_init_internal(struct llama_model * model, const c
         llama_file gguf_file(path_lora, "rb");
         std::vector<uint8_t> read_buf;
         auto set_tensor = [&](struct ggml_tensor * orig, struct ggml_tensor * dev) {
-            size_t offs = gguf_get_data_offset(ctx_gguf) + gguf_get_tensor_offset(ctx_gguf, gguf_find_tensor(ctx_gguf, orig->name));
-            size_t size = ggml_nbytes(orig);
+            const size_t offs = gguf_get_data_offset(ctx_gguf) + gguf_get_tensor_offset(ctx_gguf, gguf_find_tensor(ctx_gguf, orig->name));
+            const size_t size = ggml_nbytes(orig);
+            // ported from llama.cpp 10bf611e5: reject corrupted/incomplete files
+            if (offs + size < offs || offs + size > gguf_file.size()) {
+                throw std::runtime_error(format("LoRA tensor '%s' data is not within the file bounds, file is corrupted or incomplete", orig->name));
+            }
             read_buf.resize(size);
             gguf_file.seek(offs, SEEK_SET);
             gguf_file.read_raw(read_buf.data(), size);
