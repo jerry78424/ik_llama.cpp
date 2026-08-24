@@ -9,8 +9,14 @@
     3. write weights + ids to global memory
 
     It is intended as fusion of softmax->top-k->get_rows pipeline for MoE models
+
+    With sqrt_sp = true, step 1 becomes w = sqrt(softplus(logit)) instead
+    (DeepSeek-V4 gating; ported from llama.cpp 846e991ec). Bias, when provided,
+    is applied AFTER the activation for ranking only, and the weight written
+    for a selected expert is the UNBIASED activated value -- exactly matching
+    the unfused graph (probs -> add(bias) -> argsort -> get_rows(probs)).
 */
-template <size_t n_experts, bool normalize>
+template <size_t n_experts, bool normalize, bool sqrt_sp = false>
 __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * logits,
                                                                   float *       weights,
                                                                   int32_t *     ids,
@@ -29,6 +35,81 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
     constexpr int experts_per_thread = (n_experts > WARP_SIZE) ? n_experts / WARP_SIZE : 1;
 
     float logits_r[experts_per_thread];
+
+    if (sqrt_sp) {
+        // DeepSeek-V4 gating (ported from llama.cpp 846e991ec), adapted to this
+        // app's single-node ggml_sqrt_softplus representation. Bias is applied
+        // AFTER activation for ranking only; selected weights are written as the
+        // UNBIASED activated values, matching the unfused graph exactly
+        // (probs -> add(bias) -> argsort -> get_rows(probs) -> sum_rows/div).
+#pragma unroll
+        for (int i = 0; i < n_experts; i += WARP_SIZE) {
+            const int expert        = i + threadIdx.x;
+            logits_r[i / WARP_SIZE] = expert < n_experts ? logits[expert] : -INFINITY;
+        }
+
+        float wt[experts_per_thread];
+        float rank[experts_per_thread];
+
+#pragma unroll
+        for (int i = 0; i < experts_per_thread; i++) {
+            const float val = logits_r[i];
+            // matches ggml_sqrt_softplus: softplus clamps at x > 20, then sqrt
+            wt[i]   = val == -INFINITY ? -INFINITY : sqrtf(val > 20.0f ? val : logf(1.0f + expf(val)));
+        }
+#pragma unroll
+        for (int i = 0; i < experts_per_thread; i++) {
+            const int expert = threadIdx.x + i * WARP_SIZE;
+            rank[i]          = (bias && expert < n_experts) ? wt[i] + bias[expert] : wt[i];
+        }
+
+        [[maybe_unused]] float sum_selected = 0;
+        for (int k = 0; k < n_expert_used; k++) {
+            float max_val    = rank[0];
+            int   max_expert = threadIdx.x;
+
+#pragma unroll
+            for (int i = 1; i < experts_per_thread; i++) {
+                const int expert = threadIdx.x + i * WARP_SIZE;
+                if (expert < n_experts && rank[i] > max_val) {
+                    max_val    = rank[i];
+                    max_expert = expert;
+                }
+            }
+
+#pragma unroll
+            for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
+                const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
+                const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
+                if (val > max_val) {
+                    max_val    = val;
+                    max_expert = expert;
+                }
+            }
+
+            // the unbiased activated weight lives on the owning lane's slot
+            const float sel      = __shfl_sync(0xFFFFFFFF, wt[max_expert / WARP_SIZE], max_expert & (WARP_SIZE - 1));
+            const bool  owner    = (max_expert & (WARP_SIZE - 1)) == threadIdx.x;
+            if (owner) {
+                rank[max_expert / WARP_SIZE] = -INFINITY;
+                weights[k]                   = sel;
+                ids[k]                       = max_expert;
+            }
+            sum_selected += sel;
+        }
+
+        if (!normalize) {
+            return;
+        }
+
+        __syncthreads();
+
+        const float norm = 1 / sum_selected;
+        for (int k = threadIdx.x; k < n_expert_used; k += WARP_SIZE) {
+            weights[k] *= norm;
+        }
+        return;
+    }
 
 #pragma unroll
     for (int i = 0; i < n_experts; i += WARP_SIZE) {
@@ -150,7 +231,7 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void simple_moe_cuda(const float 
     }
 }
 
-template <bool normalize>
+template <bool normalize, bool sqrt_sp = false>
 static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
                                  const float *               logits,
                                  float *                     weights,
@@ -171,34 +252,34 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
 
     switch (n_expert) {
         case 1:
-            topk_moe_cuda<1, normalize><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
+            topk_moe_cuda<1, normalize, sqrt_sp><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
             break;
         case 2:
-            topk_moe_cuda<2, normalize><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
+            topk_moe_cuda<2, normalize, sqrt_sp><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
             break;
         case 4:
-            topk_moe_cuda<4, normalize><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
+            topk_moe_cuda<4, normalize, sqrt_sp><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
             break;
         case 8:
-            topk_moe_cuda<8, normalize><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
+            topk_moe_cuda<8, normalize, sqrt_sp><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
             break;
         case 16:
-            topk_moe_cuda<16, normalize><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
+            topk_moe_cuda<16, normalize, sqrt_sp><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
             break;
         case 32:
-            topk_moe_cuda<32, normalize><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
+            topk_moe_cuda<32, normalize, sqrt_sp><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
             break;
         case 64:
-            topk_moe_cuda<64, normalize><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
+            topk_moe_cuda<64, normalize, sqrt_sp><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
             break;
         case 128:
-            topk_moe_cuda<128, normalize><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
+            topk_moe_cuda<128, normalize, sqrt_sp><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
             break;
         case 256:
-            topk_moe_cuda<256, normalize><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
+            topk_moe_cuda<256, normalize, sqrt_sp><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
             break;
         case 512:
-            topk_moe_cuda<512, normalize><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
+            topk_moe_cuda<512, normalize, sqrt_sp><<<grid_dims, block_dims, 0, stream>>>(logits, weights, ids, bias, n_rows, n_expert_used);
             break;
         default:
             GGML_ASSERT(false && "fatal error");
@@ -210,7 +291,8 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context & ctx,
                            const ggml_tensor *         logits,
                            ggml_tensor *               weights,
                            ggml_tensor *               ids,
-                           ggml_tensor *               bias) {
+                           ggml_tensor *               bias,
+                           bool                        sqrt_softplus) {
     GGML_ASSERT(logits->type == GGML_TYPE_F32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
@@ -230,6 +312,17 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context & ctx,
     GGML_ASSERT(ids->nb[1] / ggml_type_size(ids->type) == (size_t) n_experts);
 
     cudaStream_t stream = ctx.stream();
+
+    if (sqrt_softplus) {
+        if (weights->op == GGML_OP_DIV) {
+            const int n_expert_used = weights->ne[0];
+            launch_topk_moe_cuda<true, true>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used);
+        } else {
+            const int n_expert_used = weights->ne[1];
+            launch_topk_moe_cuda<false, true>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used);
+        }
+        return;
+    }
 
     if (weights->op == GGML_OP_DIV) {
         const int n_expert_used = weights->ne[0];
@@ -261,6 +354,20 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * softmax, const ggml_tenso
     }
 
     const int n_expert = softmax->ne[0];
+    // n_expert must be a power of 2
+    if ((n_expert & (n_expert - 1)) != 0 || n_expert > 512) {
+        return false;
+    }
+
+    return true;
+}
+
+bool ggml_cuda_should_use_topk_moe_unary(const ggml_tensor * activation, const ggml_tensor * weights) {
+    if (!ggml_is_contiguous(activation->src[0]) || !ggml_is_contiguous(weights)) {
+        return false;
+    }
+
+    const int n_expert = activation->ne[0];
     // n_expert must be a power of 2
     if ((n_expert & (n_expert - 1)) != 0 || n_expert > 512) {
         return false;

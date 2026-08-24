@@ -3893,7 +3893,58 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     ggml_cuda_op_softplus(ctx, dst);
                     break;
                 case GGML_UNARY_OP_SQRT_SOFTPLUS:
-                    ggml_cuda_op_sqrt_softplus(ctx, dst);
+                    // Fused MoE routing for sqrt(softplus(logits)) gating
+                    // (DeepSeek-V4). Ported from llama.cpp 846e991ec and adapted
+                    // to this app's single-node sqrt_softplus op plus top-k
+                    // pipeline (argsort -> view -> get_rows). The fused kernel
+                    // ranks on activation+bias but writes UNBIASED activated
+                    // weights, matching the unfused graph numerically.
+                    // IK_DISABLE_SQRT_SOFTPLUS_FUSION=1 forces the reference path.
+                    if (fusion && getenv("IK_DISABLE_SQRT_SOFTPLUS_FUSION") == nullptr) {
+                        ggml_cuda_op_sqrt_softplus(ctx, dst);
+                        break;
+                    }
+                    if (fusion && i + 8 < cgraph->n_nodes &&
+                        cgraph->nodes[i+1]->op == GGML_OP_ADD      &&
+                        cgraph->nodes[i+2]->op == GGML_OP_ARGSORT  &&
+                        cgraph->nodes[i+3]->op == GGML_OP_VIEW     &&
+                        cgraph->nodes[i+4]->op == GGML_OP_RESHAPE  &&
+                        cgraph->nodes[i+5]->op == GGML_OP_GET_ROWS &&
+                        cgraph->nodes[i+6]->op == GGML_OP_RESHAPE  &&
+                        cgraph->nodes[i+7]->op == GGML_OP_SUM_ROWS &&
+                        cgraph->nodes[i+8]->op == GGML_OP_DIV &&
+                        cgraph->nodes[i+1]->src[0] == dst &&
+                        ggml_cuda_should_use_topk_moe_unary(dst, cgraph->nodes[i+8]) &&
+                        ops_are_same_device(cgraph, i, i+8)) {
+                        ggml_cuda_op_topk_moe(ctx, dst, cgraph->nodes[i+8], cgraph->nodes[i+3], cgraph->nodes[i+1]->src[1], true);
+                        i += 8;
+                    }
+                    else if (fusion && i + 7 < cgraph->n_nodes &&
+                        cgraph->nodes[i+1]->op == GGML_OP_ARGSORT  &&
+                        cgraph->nodes[i+2]->op == GGML_OP_VIEW     &&
+                        cgraph->nodes[i+3]->op == GGML_OP_RESHAPE  &&
+                        cgraph->nodes[i+4]->op == GGML_OP_GET_ROWS &&
+                        cgraph->nodes[i+5]->op == GGML_OP_RESHAPE  &&
+                        cgraph->nodes[i+6]->op == GGML_OP_SUM_ROWS &&
+                        cgraph->nodes[i+7]->op == GGML_OP_DIV &&
+                        ggml_cuda_should_use_topk_moe_unary(dst, cgraph->nodes[i+7]) &&
+                        ops_are_same_device(cgraph, i, i+7)) {
+                        ggml_cuda_op_topk_moe(ctx, dst, cgraph->nodes[i+7], cgraph->nodes[i+2], nullptr, true);
+                        i += 7;
+                    }
+                    else if (fusion && i + 4 < cgraph->n_nodes &&
+                        cgraph->nodes[i+1]->op == GGML_OP_ARGSORT  &&
+                        cgraph->nodes[i+2]->op == GGML_OP_VIEW     &&
+                        cgraph->nodes[i+3]->op == GGML_OP_RESHAPE  &&
+                        cgraph->nodes[i+4]->op == GGML_OP_GET_ROWS &&
+                        ggml_cuda_should_use_topk_moe_unary(dst, cgraph->nodes[i+4]) &&
+                        ops_are_same_device(cgraph, i, i+4)) {
+                        ggml_cuda_op_topk_moe(ctx, dst, cgraph->nodes[i+4], cgraph->nodes[i+2], nullptr, true);
+                        i += 4;
+                    }
+                    else {
+                        ggml_cuda_op_sqrt_softplus(ctx, dst);
+                    }
                     break;
                 default:
                     return -1;
