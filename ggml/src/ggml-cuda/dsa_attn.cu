@@ -263,7 +263,13 @@ bool ggml_cuda_dsa_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     if (Q->ne[1] <= 16) {
         if (indexer->ne[0] >= K->ne[1]) return false;
     } else {
-        if (K->ne[1] < 4*indexer->ne[0]) return false; // for efficiency
+        // For HCA layers top_k = PAD(n_swa + ceil(nkv/HCA_RATIO), 256) grows with position.
+        // With a 4x gate, the moment padded top_k exceeds Krows/4 (DSV4-Flash: at padded
+        // nkv >= 151552 where top_k becomes 1536 vs Krows 5632), these nodes get rejected
+        // and fall back to the generic FA path costing ~43 ms/launch on RTX 5090 - a
+        // permanent ~10% prefill cliff. The gather path remains far cheaper than the
+        // generic fallback down to a 3x ratio, so accept it there.
+        if (K->ne[1] < 3*indexer->ne[0]) return false; // for efficiency
     }
     if (K->ne[2] > 1 || K->ne[3] > 1 || mask->ne[2] > 1 || mask->ne[3] > 1 || Q->ne[3] > 1) return false;
     if ((K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_Q8_0) ||
