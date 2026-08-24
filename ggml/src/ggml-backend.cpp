@@ -1152,8 +1152,10 @@ struct ggml_backend_sched_split {
     int backend_id;
     int i_start;
     int i_end;
-    struct ggml_tensor * inputs[GGML_SCHED_MAX_SPLIT_INPUTS];
+    // dynamic array (ported from llama.cpp dbadb68ee), grows on demand
+    struct ggml_tensor ** inputs;
     int n_inputs;
+    int inputs_capacity;
     // graph view of this split
     struct ggml_cgraph graph;
 };
@@ -1193,8 +1195,9 @@ struct ggml_backend_sched {
     int n_copies;
     int cur_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
-    struct ggml_tensor * graph_inputs[GGML_SCHED_MAX_SPLIT_INPUTS];
+    struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
+    int graph_inputs_capacity;
 
     struct ggml_context * ctx;
 
@@ -1410,6 +1413,37 @@ static inline bool ggml_backend_sched_offload_enabled(ggml_backend_sched_t sched
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
+
+// dynamic growth of split/graph input containers (ported from llama.cpp dbadb68ee)
+static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split * split) {
+    int new_cap = GGML_SCHED_MAX_SPLIT_INPUTS;
+    if (split->inputs_capacity > 0) {
+        new_cap = 2*split->inputs_capacity;
+        fprintf(stderr, "%s: increasing split inputs capacity from %d to %d\n", __func__, split->inputs_capacity, new_cap);
+    }
+    auto * pnew = (struct ggml_tensor **) realloc((void *) split->inputs, new_cap * sizeof(struct ggml_tensor *));
+    if (pnew == NULL) {
+        fprintf(stderr, "%s: failed to allocate %zu bytes\n", __func__, new_cap * sizeof(struct ggml_tensor *));
+        GGML_ABORT("failed to grow split inputs container");
+    }
+    split->inputs = pnew;
+    split->inputs_capacity = new_cap;
+}
+
+static void ggml_backend_sched_graph_inputs_grow(ggml_backend_sched_t sched) {
+    int new_cap = GGML_SCHED_MAX_SPLIT_INPUTS;
+    if (sched->graph_inputs_capacity > 0) {
+        new_cap = 2*sched->graph_inputs_capacity;
+        fprintf(stderr, "%s: increasing graph inputs capacity from %d to %d\n", __func__, sched->graph_inputs_capacity, new_cap);
+    }
+    auto * pnew = (struct ggml_tensor **) realloc((void *) sched->graph_inputs, new_cap * sizeof(struct ggml_tensor *));
+    if (pnew == NULL) {
+        fprintf(stderr, "%s: failed to allocate %zu bytes\n", __func__, new_cap * sizeof(struct ggml_tensor *));
+        GGML_ABORT("failed to grow graph inputs container");
+    }
+    sched->graph_inputs = pnew;
+    sched->graph_inputs_capacity = new_cap;
+}
 
 // returns the priority of the backend, lower id is higher priority
 static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backend_t backend) {
@@ -1923,7 +1957,7 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                     }
                     // check if the split has too many inputs
                     // FIXME: count the number of inputs instead of only checking when full
-                    if (split->n_inputs == GGML_SCHED_MAX_SPLIT_INPUTS) {
+                    if (split->n_inputs >= split->inputs_capacity) {
                         const size_t id = hash_id(src);
                         int src_backend_id = sched->hv_tensor_backend_ids[id];
                         bool supported = ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
@@ -1940,9 +1974,14 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                 split->i_end = i;
                 i_split++;
                 if (i_split >= sched->splits_capacity) {
+                    int old_cap = sched->splits_capacity;
                     sched->splits_capacity *= 2;
                     sched->splits = (ggml_backend_sched_split *)realloc(sched->splits, sched->splits_capacity * sizeof(struct ggml_backend_sched_split));
                     GGML_ASSERT(sched->splits != NULL);
+                    // new slots must start zeroed so split->inputs starts NULL
+                    for (int k = old_cap; k < sched->splits_capacity; k++) {
+                        memset(&sched->splits[k], 0, sizeof(struct ggml_backend_sched_split));
+                    }
                 }
                 GGML_ASSERT(i_split < GGML_SCHED_MAX_SPLITS);
                 split = &sched->splits[i_split];
@@ -1982,7 +2021,9 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                             SET_CAUSE(tensor_copy, "4.cpy");
                         }
                         int n_graph_inputs = sched->n_graph_inputs++;
-                        GGML_ASSERT(n_graph_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);
+                        if (n_graph_inputs >= sched->graph_inputs_capacity) {
+                            ggml_backend_sched_graph_inputs_grow(sched);
+                        }
                         sched->graph_inputs[n_graph_inputs] = src;
                     }
                 }
@@ -2009,11 +2050,9 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                             SET_CAUSE(tensor_copy, "4.cpy");
                         }
                         int n_inputs = split->n_inputs++;
-                        if (n_inputs >= GGML_SCHED_MAX_SPLIT_INPUTS) {
-                            printf("======================== Oops, too many inputs (%d)\n", n_inputs+1);
-                            for (int k = 0; k < n_inputs; ++k) printf("Input %2d: %s\n", k, split->inputs[k]->name);
+                        if (n_inputs >= split->inputs_capacity) {
+                            ggml_backend_sched_split_inputs_grow(split);
                         }
-                        GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);
                         split->inputs[n_inputs] = src;
                         }
                     }
@@ -2040,7 +2079,15 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
         sched->prev_leaf_backend_ids = tmp;
     }
 
-    int graph_size = graph->n_nodes + sched->n_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
+    // exact input count (ported from llama.cpp dbadb68ee): with dynamically
+    // growing split inputs there is no fixed per-split cap anymore, so the
+    // old n_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2 upper bound would under-size
+    // graph_copy and corrupt the heap when a split exceeds 64 inputs.
+    int total_inputs = sched->n_graph_inputs;
+    for (int i = 0; i < sched->n_splits; i++) {
+        total_inputs += sched->splits[i].n_inputs;
+    }
+    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies;
     if (sched->graph.size < graph_size) {
         sched->graph.size = graph_size;
         sched->graph.nodes = (ggml_tensor **)realloc(sched->graph.nodes, graph_size * sizeof(struct ggml_tensor *));
@@ -2809,6 +2856,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->splits = (ggml_backend_sched_split *)calloc(initial_splits_capacity, sizeof(sched->splits[0]));
     sched->splits_capacity = initial_splits_capacity;
 
+    sched->graph_inputs_capacity = GGML_SCHED_MAX_SPLIT_INPUTS;
+    sched->graph_inputs = (struct ggml_tensor **) calloc(sched->graph_inputs_capacity, sizeof(struct ggml_tensor *));
+
     for (int b = 0; b < n_backends; b++) {
         sched->backends[b] = backends[b];
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
@@ -2868,7 +2918,11 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
     ggml_hash_set_free(&sched->hash_set);
+    for (int i = 0; i < sched->splits_capacity; i++) {
+        free(sched->splits[i].inputs);
+    }
     free(sched->splits);
+    free(sched->graph_inputs);
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);
     free(sched->node_backend_ids);
