@@ -855,6 +855,29 @@ void server_metrics::on_prediction(const server_slot& slot) {
     n_tokens_predicted += slot.n_decoded;
     t_tokens_generation += slot.t_token_generation;
     t_tokens_generation_total += slot.t_token_generation;
+
+    // speculative decoding lifetime totals (ported from llama.cpp a035a8887).
+    // this fork calls on_prediction once per finished request, after release();
+    // the draft stats are zeroed only by reset() when the next task arrives.
+    n_draft_tokens_total      += (uint64_t) slot.n_draft_total;
+    n_draft_accepted_total    += (uint64_t) slot.n_draft_accepted;
+    // each drafted round bumps depth 0 exactly once => verification steps
+    n_draft_verif_steps_total += slot.n_draft_by_depth.empty() ? 0 : (uint64_t) slot.n_draft_by_depth[0];
+
+    if (n_accepted_per_pos_total.size() < slot.n_draft_accepted_by_depth.size()) {
+        n_accepted_per_pos_total.resize(slot.n_draft_accepted_by_depth.size(), 0);
+    }
+    for (size_t i = 0; i < slot.n_draft_accepted_by_depth.size(); i++) {
+        n_accepted_per_pos_total[i] += (uint64_t) slot.n_draft_accepted_by_depth[i];
+    }
+
+    // beyond upstream a035a8887: this app also tracks drafted tokens per depth
+    if (n_drafted_per_pos_total.size() < slot.n_draft_by_depth.size()) {
+        n_drafted_per_pos_total.resize(slot.n_draft_by_depth.size(), 0);
+    }
+    for (size_t i = 0; i < slot.n_draft_by_depth.size(); i++) {
+        n_drafted_per_pos_total[i] += (uint64_t) slot.n_draft_by_depth[i];
+    }
 }
 
 void server_metrics::reset_bucket() {
@@ -2929,6 +2952,12 @@ void server_context::process_single_task(server_task&& task) {
             { "t_prompt_processing",             metrics.t_prompt_processing},
             { "n_tokens_predicted",              metrics.n_tokens_predicted},
             { "t_tokens_generation",             metrics.t_tokens_generation},
+
+            { "n_draft_tokens_total",            metrics.n_draft_tokens_total},
+            { "n_draft_accepted_total",          metrics.n_draft_accepted_total},
+            { "n_draft_verif_steps_total",       metrics.n_draft_verif_steps_total},
+            { "n_accepted_per_pos_total",        metrics.n_accepted_per_pos_total},
+            { "n_drafted_per_pos_total",         metrics.n_drafted_per_pos_total},
 
             { "kv_cache_tokens_count",           llama_get_kv_cache_token_count(ctx)},
             { "kv_cache_used_cells",             llama_get_kv_cache_used_cells(ctx)},

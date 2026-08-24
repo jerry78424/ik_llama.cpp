@@ -227,6 +227,14 @@ struct server_metrics {
     uint64_t n_tokens_predicted = 0;
     uint64_t t_tokens_generation = 0;
 
+    // lifetime speculative decoding totals (ported from llama.cpp a035a8887);
+    // never reset by reset_bucket, slot stats survive release()
+    uint64_t n_draft_tokens_total = 0;
+    uint64_t n_draft_accepted_total = 0;
+    uint64_t n_draft_verif_steps_total = 0;
+    std::vector<uint64_t> n_accepted_per_pos_total;
+    std::vector<uint64_t> n_drafted_per_pos_total;
+
     void init();
 
     void on_prompt_eval(const server_slot& slot);

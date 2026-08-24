@@ -904,6 +904,18 @@ int main(int argc, char ** argv) {
                     {"name",  "tokens_predicted_seconds_total"},
                     {"help",  "Predict process time"},
                     {"value",  (uint64_t) data.at("t_tokens_generation_total") / 1.e3}
+            }, {
+                    {"name",  "spec_decode_num_draft_tokens_total"},
+                    {"help",  "Total draft tokens generated"},
+                    {"value",  (uint64_t) data.at("n_draft_tokens_total")}
+            }, {
+                    {"name",  "spec_decode_num_accepted_tokens_total"},
+                    {"help",  "Total draft tokens accepted by the target model"},
+                    {"value",  (uint64_t) data.at("n_draft_accepted_total")}
+            }, {
+                    {"name",  "spec_decode_num_drafts_total"},
+                    {"help",  "Total speculative decoding verification steps"},
+                    {"value",  (uint64_t) data.at("n_draft_verif_steps_total")}
             }}},
             {"gauge", {{
                     {"name",  "prompt_tokens_seconds"},
@@ -948,6 +960,27 @@ int main(int argc, char ** argv) {
                             << "llamacpp:"        << name << " " << value << "\n";
             }
         }
+
+        // labeled counters: one time series per draft position (ported from
+        // llama.cpp a035a8887, plus the drafted-per-position series unique to
+        // this app's slot stats)
+        const auto emit_per_pos = [&](const char * name, const char * help, const json & series) {
+            if (!series.is_array() || series.empty()) {
+                return;
+            }
+            prometheus << "# HELP llamacpp:" << name << " " << help << "\n"
+                        << "# TYPE llamacpp:" << name << " counter\n";
+            for (size_t i = 0; i < series.size(); i++) {
+                prometheus << "llamacpp:" << name << "{position=\"" << i << "\"} "
+                           << (uint64_t) series[i] << "\n";
+            }
+        };
+        emit_per_pos("spec_decode_num_accepted_tokens_per_pos_total",
+                     "Accepted draft tokens per draft position",
+                     data.at("n_accepted_per_pos_total"));
+        emit_per_pos("spec_decode_num_drafted_tokens_per_pos_total",
+                     "Drafted tokens per draft position",
+                     data.at("n_drafted_per_pos_total"));
 
         const int64_t t_start = data.at("t_start");
         res.set_header("Process-Start-Time-Unix", std::to_string(t_start));
