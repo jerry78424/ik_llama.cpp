@@ -266,10 +266,19 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         llama_set_dflash_visible_cross_ctx(ctx_dft, this->cross_ctx);
         llama_set_dflash_dspark(ctx_dft, is_dspark);
-        LOG_INF("%s: DFlash context ready (n_ctx=%d, block_size=%d, query_capacity=%d, active_width=%d, cross_ctx=%d, n_target_features=%d, n_target_layers=%d, host_ring=%.2f MiB)\n",
+       // build the list first so the whole vector lands on one log line
+        std::string target_layers_str;
+        const char * sep = "";
+        for (const auto id : target_layer_ids) {
+            target_layers_str += sep;
+            target_layers_str += std::to_string(id);
+            sep = ", ";
+        }
+        LOG_INF("%s: DFlash context ready (n_ctx=%d, block_size=%d, query_capacity=%d, active_width=%d, cross_ctx=%d, n_target_features=%d, n_target_layers=%d, host_ring=%.2f MiB, target_layers=[%s])\n",
                 __func__, llama_n_ctx(ctx_dft), block_size, query_capacity, active_width, this->cross_ctx,
                 n_target_features, n_target_layers,
-                (double) target_window_ring.size() * sizeof(float) / (1024.0 * 1024.0));
+                (double) target_window_ring.size() * sizeof(float) / (1024.0 * 1024.0),
+                target_layers_str.c_str());
     }
     ~common_speculative_state_dflash() override {
         if (rebuild_count > 0) {
