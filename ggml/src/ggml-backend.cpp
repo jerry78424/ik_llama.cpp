@@ -2223,9 +2223,19 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// one consumed expert-prefetch slot issue: what copy_inputs swapped into the
+// graph's input copy while staging through a slot; the caller releases the slot
+// (free event + pointer restore) once the split's kernels have been launched
+struct ggml_sched_prefetch_issue {
+    int slot = -1;
+    ggml_tensor * input_cpy = nullptr;
+    ggml_backend_buffer_t saved_buffer = nullptr;
+    void * saved_data = nullptr;
+};
+
 static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_backend_sched_split * split, std::array<bool, GGML_SCHED_MAX_BACKENDS> & needs_sync,
         std::vector<int32_t> & ids, std::vector<uint32_t> & unique_ids, ggml_tensor * last_ids_tensor,
-        int & prefetch_slot, ggml_tensor *& prefetch_input_cpy, ggml_backend_buffer_t & prefetch_saved_buffer, void * & prefetch_saved_data) {
+        std::vector<ggml_sched_prefetch_issue> & prefetch_issues) {
     if (split->n_inputs < 1) return;
     constexpr bool k_set_sync = false;
     int split_backend_id = split->backend_id;
@@ -2252,14 +2262,30 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
         } else {
             // with a large batch virtually every expert is used, so instead of waiting for
             // the routing ids, upload the full tensor through the prefetch backend and let
-            // the copy overlap compute of the previous split
+            // the copy overlap compute of the previous split.
+            // GGML_SCHED_PREFETCH_FULL_TENSOR=1 issues EVERY eligible host-weight input of
+            // the split into its own slot: no selective fallback, hence no per-layer device
+            // drains -- but also no inactive-expert byte savings (measured +12% H2D bytes,
+            // net -3% pp on DSV4 ub=8192 where the co-bound link prefers smaller slices).
+            // Default keeps the single-issue guard so later inputs stream through the
+            // selective path, which stays cheaper whenever experts are not all hit.
+            static const bool prefetch_full_tensor = [] {
+                const char * env = getenv("GGML_SCHED_PREFETCH_FULL_TENSOR");
+                return env != nullptr && env[0] == '1';
+            }();
             if (sched->prefetch_experts && !sched->is_async && !sched->callback_eval &&
-                    prefetch_slot == -1 && split->graph.n_nodes > 0) {
+                    (prefetch_full_tensor || prefetch_issues.empty()) &&
+                    // never issue more uploads per split than the pool can hold
+                    // distinctly: prefetch_cur wraps, so issue k+N_slots would
+                    // overwrite its own still-in-flight staging buffer
+                    (int) prefetch_issues.size() < sched->prefetch_n_slots && split->graph.n_nodes > 0) {
                 ggml_tensor * node = split->graph.nodes[0];
                 if (ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                     ggml_backend_buffer_is_host(input->buffer) &&
                     (node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_MOE_FUSED_UP_GATE) &&
-                    node->src[0] == input_cpy) {
+                    (prefetch_full_tensor ?
+                        (node->src[0] == input_cpy || node->src[1] == input_cpy) :
+                        (node->src[0] == input_cpy))) {
                     const ggml_tensor * ids = node->op == GGML_OP_MUL_MAT_ID ? node->src[2] : node->src[3];
                     const int64_t n_expert = node->src[0]->ne[2];
                     if (ids->ne[0]*ids->ne[1] >= 2*n_expert &&
@@ -2273,15 +2299,17 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                         // point the staging copy at the slot only for the duration of this
                         // split, so a fallback to the regular path on a later eval can never
                         // see a dangling slot pointer
-                        prefetch_slot         = slot;
-                        prefetch_input_cpy    = input_cpy;
-                        prefetch_saved_buffer = input_cpy->buffer;
-                        prefetch_saved_data   = input_cpy->data;
+                        ggml_sched_prefetch_issue issue;
+                        issue.slot             = slot;
+                        issue.input_cpy        = input_cpy;
+                        issue.saved_buffer     = input_cpy->buffer;
+                        issue.saved_data       = input_cpy->data;
                         input_cpy->buffer = sched->prefetch_slots[slot];
                         input_cpy->data   = ggml_backend_buffer_get_base(sched->prefetch_slots[slot]);
                         ggml_backend_tensor_set_async(sched->prefetch_backend, input_cpy, input->data, 0, ggml_nbytes(input));
                         ggml_backend_event_record(sched->prefetch_ready[slot]);
                         ggml_backend_event_wait(split_backend, sched->prefetch_ready[slot]);
+                        prefetch_issues.push_back(issue);
                         continue;
                     }
                 }
@@ -2530,12 +2558,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     int copy_thread = last_reduce >= 0 ? last_reduce : 0;
                     if (ith == copy_thread) {
                         // prefetch is only wired to the sequential path (sched->is_async is false there)
-                        int prefetch_slot = -1;
-                        ggml_tensor * prefetch_input_cpy = NULL;
-                        ggml_backend_buffer_t prefetch_saved_buffer = NULL;
-                        void * prefetch_saved_data = NULL;
+                        std::vector<ggml_sched_prefetch_issue> prefetch_issues;
                         ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, ids, unique_ids, last_ids_tensor,
-                            prefetch_slot, prefetch_input_cpy, prefetch_saved_buffer, prefetch_saved_data);
+                            prefetch_issues);
                     }
                     #pragma omp barrier
                 }
@@ -2611,12 +2636,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     int copy_thread = last_reduce >= 0 ? last_reduce : 0;
                     if (ith == copy_thread) {
                         // prefetch is only wired to the sequential path (sched->is_async is false there)
-                        int prefetch_slot = -1;
-                        ggml_tensor * prefetch_input_cpy = NULL;
-                        ggml_backend_buffer_t prefetch_saved_buffer = NULL;
-                        void * prefetch_saved_data = NULL;
+                        std::vector<ggml_sched_prefetch_issue> prefetch_issues;
                         ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, ids, unique_ids, last_ids_tensor,
-                            prefetch_slot, prefetch_input_cpy, prefetch_saved_buffer, prefetch_saved_data);
+                            prefetch_issues);
                     }
                     barrier.arrive_and_wait();
                 }
@@ -2748,10 +2770,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[i];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
-        int split_prefetch_slot = -1;
-        ggml_tensor * prefetch_input_cpy = NULL;
-        ggml_backend_buffer_t prefetch_saved_buffer = NULL;
-        void * prefetch_saved_data = NULL;
+        std::vector<ggml_sched_prefetch_issue> split_prefetch_issues;
 
         // [port] llama.cpp 849798132: ensure the previous split's async work has
         // completed before this split runs when it has no inputs of its own -- the
@@ -2782,7 +2801,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, ids, unique_ids, last_ids_tensor,
-            split_prefetch_slot, prefetch_input_cpy, prefetch_saved_buffer, prefetch_saved_data);
+            split_prefetch_issues);
 
         // ids are now final and host-visible; enqueue the selected expert
         // slices of this split's host-computed MoE matmuls (up/gate and down
@@ -2803,12 +2822,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
         auto ec = ggml_backend_sched_eval(sched, split_backend, split);
-        if (split_prefetch_slot != -1) {
+        for (const ggml_sched_prefetch_issue & issue : split_prefetch_issues) {
             // the kernels have captured the slot address at launch, safe to restore now
-            ggml_backend_event_record(sched->prefetch_free[split_prefetch_slot]);
-            sched->prefetch_used[split_prefetch_slot] = true;
-            prefetch_input_cpy->buffer = prefetch_saved_buffer;
-            prefetch_input_cpy->data   = prefetch_saved_data;
+            ggml_backend_event_record(sched->prefetch_free[issue.slot]);
+            sched->prefetch_used[issue.slot] = true;
+            issue.input_cpy->buffer = issue.saved_buffer;
+            issue.input_cpy->data   = issue.saved_data;
         }
         if (ec != GGML_STATUS_SUCCESS) {
             return ec;
