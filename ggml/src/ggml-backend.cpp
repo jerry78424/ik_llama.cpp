@@ -1278,8 +1278,20 @@ void ggml_backend_sched_set_max_extra_alloc(ggml_backend_sched_t sched, int extr
 // ids, the full expert tensors are uploaded through a second backend instance on the same
 // device (own stream), rotating between staging slots so uploads overlap compute
 
-static void ggml_backend_sched_prefetch_disable(ggml_backend_sched_t sched, ggml_backend_t split_backend) {
+// Ported pattern from oussemah/llama.cpp 69b3b0c: silent degradation is
+// indistinguishable from a slow machine. Every decline announces ONCE
+// (per-process; single-instance policy makes that equivalent to per-sched).
+static void ggml_backend_sched_prefetch_decline_once(const char * reason) {
+    static bool announced = false;
+    if (!announced) {
+        announced = true;
+        fprintf(stderr, "%s: expert prefetch declined (%s)\n", __func__, reason);
+    }
+}
+
+static void ggml_backend_sched_prefetch_disable(ggml_backend_sched_t sched, ggml_backend_t split_backend, const char * reason) {
     sched->prefetch_experts = false;
+    fprintf(stderr, "%s: expert prefetch disabled (%s)\n", __func__, reason ? reason : "unknown");
     if (sched->prefetch_backend) {
         ggml_backend_synchronize(split_backend);
         ggml_backend_synchronize(sched->prefetch_backend);
@@ -1321,6 +1333,7 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
 #ifdef GGML_USE_CUDA
         if (!ggml_backend_is_cuda(split_backend)) {
             sched->prefetch_experts = false;
+            ggml_backend_sched_prefetch_decline_once("split backend is not CUDA");
             return false;
         }
         sched->prefetch_dev_id = ggml_backend_cuda_device(split_backend);
@@ -1328,10 +1341,12 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
         sched->prefetch_backend = ggml_backend_cuda_init(sched->prefetch_dev_id, NULL, NULL);
 #else
         sched->prefetch_experts = false;
+        ggml_backend_sched_prefetch_decline_once("CUDA not available");
         return false;
 #endif
         if (sched->prefetch_backend == NULL) {
             sched->prefetch_experts = false;
+            ggml_backend_sched_prefetch_disable(sched, split_backend, "second CUDA context creation failed");
             return false;
         }
         for (int i = 0; i < sched->prefetch_n_slots; i++) {
@@ -1340,6 +1355,8 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
             sched->prefetch_free[i]  = ggml_backend_event_new(split_backend);
             if (sched->prefetch_ready[i] == NULL || sched->prefetch_free[i] == NULL) {
                 sched->prefetch_experts = false;
+                // pre-existing: partial events above are leaked here; logging only
+                ggml_backend_sched_prefetch_disable(sched, split_backend, "event creation failed");
                 return false;
             }
         }
@@ -1347,12 +1364,14 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
     } else {
 #ifdef GGML_USE_CUDA
         if (!ggml_backend_is_cuda(split_backend) || ggml_backend_cuda_device(split_backend) != sched->prefetch_dev_id) {
-            // slots and events are tied to a single device
-            sched->prefetch_experts = false;
+            // slots and events are tied to a single device; this graph skips
+            // prefetch but the sched stays enabled for graphs on the device
+            ggml_backend_sched_prefetch_decline_once("graph split backend differs from slot device");
             return false;
         }
 #else
         sched->prefetch_experts = false;
+        ggml_backend_sched_prefetch_decline_once("CUDA not available");
         return false;
 #endif
     }
@@ -1372,7 +1391,7 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
                     sched->prefetch_cur = 0;
                     return true;
                 }
-                ggml_backend_sched_prefetch_disable(sched, split_backend);
+                ggml_backend_sched_prefetch_disable(sched, split_backend, "slot buffer allocation failed");
                 return false;
             }
             if (sched->prefetch_slots[i] != NULL) {
