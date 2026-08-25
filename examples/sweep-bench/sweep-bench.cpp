@@ -462,6 +462,30 @@ int main(int argc, char ** argv) {
             checkpoint_data.resize(checkpoint_size);
         }
 
+        // every rep must start from the window-start state. With use_checkpoint
+        // (recurrent / openpangu / deepseek4) a second pass over the same positions
+        // is only valid after restoring the checkpoint: compacted DSV4 layers carry
+        // strict head_swa/pos_base_swa geometry and reject the stale window outright.
+        auto rep_reset = [&]() -> bool {
+            if (!use_checkpoint) {
+                if (!llama_kv_cache_seq_rm(ctx, 0, n_kv, -1)) {
+                    LOG_TEE("%s: failed to rewind sequence to %u\n", __func__, n_kv);
+                    return false;
+                }
+                return true;
+            }
+            if (n_kv == 0) {
+                llama_kv_cache_clear(ctx);
+                return true;
+            }
+            const size_t n = llama_state_seq_set_data(ctx, checkpoint_data.data(), checkpoint_data.size(), 0, 0);
+            if (n != checkpoint_size) {
+                LOG_TEE("%s: failed to restore sequence (expected %zu bytes, got %zu)\n", __func__, checkpoint_size, n);
+                return false;
+            }
+            return true;
+        };
+
         // first measure token generation performance at this context size
         std::vector<int64_t> rep_tg;
         std::vector<int64_t> rep_pp;
@@ -476,12 +500,8 @@ int main(int argc, char ** argv) {
             for (int irep = 0; irep < nrep; ++irep) {
                 const int64_t rep_start = ggml_time_us();
 
-                if (use_checkpoint) {
-                    if (n_kv == 0) {
-                        llama_kv_cache_clear(ctx);
-                    }
-                } else {
-                    llama_kv_cache_seq_rm(ctx, 0, n_kv, -1);
+                if (!rep_reset()) {
+                    return 1;
                 }
 
                 for (unsigned int i = 0; i < tg; ++i) {
@@ -506,33 +526,14 @@ int main(int argc, char ** argv) {
             }
         }
 
-        if (use_checkpoint && measure) {
-            if (n_kv > 0) {
-                const size_t n = llama_state_seq_set_data(ctx, checkpoint_data.data(), checkpoint_data.size(), 0, 0);
-                if (n != checkpoint_size) {
-                    LOG_TEE("%s: failed to restore sequence (expected %zu bytes, got %zu)\n", __func__, checkpoint_size, n);
-                    return 1;
-                }
-            } else {
-                llama_kv_cache_clear(ctx);
-            }
-        }
-
         // measure prompt processing performance
         if (measure) {
             rep_pp.reserve(nrep);
             for (int irep = 0; irep < nrep; ++irep) {
                 const int64_t rep_start = ggml_time_us();
 
-                if (use_checkpoint) {
-                    if (n_kv == 0) {
-                        llama_kv_cache_clear(ctx);
-                    }
-                } else {
-                    if (!llama_kv_cache_seq_rm(ctx, 0, n_kv, -1)) {
-                        LOG_TEE("%s: failed to rewind sequence to %u\n", __func__, n_kv);
-                        return 1;
-                    }
+                if (!rep_reset()) {
+                    return 1;
                 }
 
                 if (!pp_helper(n_kv)) {
