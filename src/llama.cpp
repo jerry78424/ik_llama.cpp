@@ -7054,6 +7054,11 @@ static int llama_decode_internal(
 
         // extract logits
         {
+            // RED LINE (documents/porting_verification.md): dflash draft contexts
+            // intentionally export NO logits when the GPU argmax tensor exists, so
+            // llama_get_logits_ith() reads ZEROS here. Any ported logic consuming
+            // draft logits/probabilities must use the unfused fallback path or the
+            // dspark_conf head readback (lctx.dspark_conf_values) instead.
             const bool dflash_skip_logits = (llm_arch_is_dflash_family(lctx.model.arch)
                 && !lctx.dflash.draft_tokens.empty());
             if (dflash_skip_logits) {
