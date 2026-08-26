@@ -41,6 +41,50 @@ void llama_set_mtp_n_heads(struct llama_context * ctx, int32_t mtp_n_heads);
 
 #define IK_PRINT_TIMING 0
 
+// env-gated chain-timing marks (IK_TRACE=1): each mark logs microseconds since
+// the previous mark, so a long host-only segment shows up as one huge delta.
+// Added 2026-08-26 to localize the O(n_kv) PURE-HOST desert that nsys placed
+// between the last pp MoE split and the first decode submission.
+// Disabled (default): every site collapses to one cached-int compare.
+static int ik_trace_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("IK_TRACE");
+        v = e ? atoi(e) : 0;
+    }
+    return v;
+}
+// thread-local so concurrent threads never corrupt each other's chain
+static thread_local long long ik_trace_prev_us = 0;
+#define IK_TMARK(name) do { \
+    if (ik_trace_enabled()) { \
+        long long now = ggml_time_us(); \
+        long long d = ik_trace_prev_us ? now - ik_trace_prev_us : 0; \
+        fprintf(stderr, "[ik-trace] %-28s +%lld us  (t=%lld ms)\n", name, d, now / 1000); \
+        ik_trace_prev_us = now; \
+    } } while (0)
+
+namespace {
+// scoped variant: logs elapsed time at scope exit and chains like IK_TMARK,
+// replacing hand-rolled t0/DONE pairs so the duration lands on the same
+// timeline as the point marks.
+class ik_scope_timer {
+    const char * name_;
+    long long    t0_;
+public:
+    ik_scope_timer(const char * name) : name_(name), t0_(ik_trace_enabled() ? ggml_time_us() : -1) {}
+    ~ik_scope_timer() {
+        if (t0_ >= 0) {
+            long long now = ggml_time_us();
+            long long d = ik_trace_prev_us ? now - ik_trace_prev_us : 0;
+            fprintf(stderr, "[ik-trace] %-28s +%lld us  (t=%lld ms) [scope]\n", name_, d, now / 1000);
+            ik_trace_prev_us = now;
+        }
+    }
+};
+} // namespace
+#define IK_SCOPE(name) ik_scope_timer ik_scope_##__COUNTER__(name)
+
 #ifdef GGML_USE_RPC
 #  include "ggml-rpc.h"
 #endif
@@ -1803,6 +1847,12 @@ static void llama_kv_cache_compact_swa(struct llama_context & lctx, uint32_t n_t
 
     if (cache.live_swa() + n_tokens <= C) {
         return;
+    }
+
+    IK_SCOPE("compact_swa");
+    if (ik_trace_enabled()) {
+        fprintf(stderr, "[ik-trace] compact_swa TRIGGER live=%u C=%u W=%u n_tok=%u\n",
+                cache.live_swa(), C, W, n_tokens);
     }
 
     const uint32_t live = cache.live_swa();
@@ -6773,10 +6823,13 @@ static int llama_decode_internal(
             }
 
             // must run before can_reuse_graph()
+            IK_TMARK("pre-compact_swa");
             llama_kv_cache_compact_swa(lctx, u_batch.n_tokens);
+            IK_TMARK("post-compact_swa");
             if (lctx.model.arch == LLM_ARCH_DEEPSEEK4 && !llama_prepare_dsv4_graph_inputs(lctx, u_batch, false, false)) {
                 return GGML_STATUS_FAILED;
             }
+            IK_TMARK("post-dsv4-inputs");
         }
 
 #if IK_PRINT_TIMING
@@ -6791,6 +6844,7 @@ static int llama_decode_internal(
         const uint64_t seq_fingerprint = llama_ubatch_seq_fingerprint(u_batch, lctx.model.arch);
         const uint64_t state_hash      = model_state_hash(lctx);
         if (!lctx.can_reuse_graph(u_batch, seq_fingerprint, state_hash)) {
+            IK_TMARK("reuse-miss");
             lctx.reset_scheduler();
             ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
 #if IK_PRINT_TIMING
@@ -6803,6 +6857,7 @@ static int llama_decode_internal(
 #endif
 
             gf = llm_build_context::llama_build_graph(lctx, u_batch, false);
+            IK_TMARK("build_graph");
 #if IK_PRINT_TIMING
             tim2 = ggml_time_us();
             printf("build_graph(...): %d us\n", int(tim2-tim1));
@@ -6812,6 +6867,7 @@ static int llama_decode_internal(
             tim1 = ggml_time_us();
 #endif
             ggml_backend_sched_alloc_graph(lctx.sched, gf);
+            IK_TMARK("alloc_graph");
 #if IK_PRINT_TIMING
             tim2 = ggml_time_us();
             printf("sched_alloc_graph(...): %d us\n", int(tim2-tim1));
@@ -6846,6 +6902,7 @@ static int llama_decode_internal(
         if (lctx.model.arch == LLM_ARCH_DEEPSEEK4 && !llama_prepare_dsv4_graph_inputs(lctx, u_batch, true, false)) {
             return GGML_STATUS_FAILED;
         }
+        IK_TMARK("dsv4-inputs-2");
 
         // the output is always the last tensor in the graph
         struct ggml_tensor * res  = gf->nodes[gf->n_nodes - 1];
@@ -6899,11 +6956,13 @@ static int llama_decode_internal(
             }
         }
         // LLAMA_LOG_INFO("graph build time: %.3f ms (%d nodes, %d leafs)\n", (ggml_time_us() - t_start_us)/1000.0, gf->n_nodes, gf->n_leafs);
+        IK_TMARK("outputs-resolved");
 #if IK_PRINT_TIMING == 1
         tim1 = ggml_time_us();
 #endif
         //fprintf(stderr, "%s: setting inputs\n", __func__);
         llama_set_inputs(lctx, u_batch);
+        IK_TMARK("set_inputs");
 #if IK_PRINT_TIMING == 1
         tim2 = ggml_time_us();
         printf("set_inputs(...): %d us\n", int(tim2-tim1));
@@ -6912,7 +6971,9 @@ static int llama_decode_internal(
         tim1 = ggml_time_us();
 #endif
         //fprintf(stderr, "%s: invoking llama_graph_compute\n", __func__);
+        IK_TMARK("pre-graph-compute");
         llama_graph_compute(lctx, gf, n_threads);
+        IK_TMARK("post-graph-compute");
 
         dsv4_trace::emit("compute", "\"n_tokens\":%d,\"head_before\":%lld", (int) n_tokens, (long long) kv_self.head);
 
