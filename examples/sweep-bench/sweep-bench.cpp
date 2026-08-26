@@ -498,12 +498,14 @@ int main(int argc, char ** argv) {
 
             rep_tg.reserve(nrep);
             for (int irep = 0; irep < nrep; ++irep) {
-                const int64_t rep_start = ggml_time_us();
-
+                // reset BEFORE the timer: the checkpoint restore cost grows with
+                // KV depth and would otherwise ride into the measured time as a
+                // depth-proportional undermeasurement of tg
                 if (!rep_reset()) {
                     return 1;
                 }
 
+                const int64_t rep_start = ggml_time_us();
                 for (unsigned int i = 0; i < tg; ++i) {
                     common_batch_clear(batch);
                     common_batch_add(batch, std::rand() % n_vocab, n_kv + i, { 0 }, true);
@@ -530,12 +532,11 @@ int main(int argc, char ** argv) {
         if (measure) {
             rep_pp.reserve(nrep);
             for (int irep = 0; irep < nrep; ++irep) {
-                const int64_t rep_start = ggml_time_us();
-
                 if (!rep_reset()) {
                     return 1;
                 }
 
+                const int64_t rep_start = ggml_time_us();
                 if (!pp_helper(n_kv)) {
                     LOG_TEE("%s: llama_decode() failed\n", __func__);
                     return 1;
