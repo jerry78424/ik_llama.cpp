@@ -54,6 +54,16 @@ static int ik_trace_enabled() {
     }
     return v;
 }
+// experiment gate: IK_MASK_FAST=0 disables the constant-region mask fast path
+// (restores the full per-cell fill) to isolate cross-window pp->tg effects.
+static int ik_mask_fast_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("IK_MASK_FAST");
+        v = e ? atoi(e) : 1;
+    }
+    return v != 0;
+}
 // thread-local so concurrent threads never corrupt each other's chain
 static thread_local long long ik_trace_prev_us = 0;
 #define IK_TMARK(name) do { \
@@ -5751,13 +5761,74 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 }
             };
 
+            // Fast path for a single-sequence causal batch: the bulk of the mask is a
+            // constant.  Full mask: cols [0, min_pos) are all 0.  SWA mask: cols
+            // [0, min_pos - n_swa_eff) are all -INF (outside every token's window).
+            // Only the recent tail needs per-cell work (noalibi_f16 below).
+            // The memset boundaries assume cells[i].pos == i (cell index == token
+            // position).  That only holds for a fresh contiguous single-seq cache;
+            // eviction/wrap, llama_kv_cache_shift or compact move pos away from i
+            // while the used==n_kv gate and the has_seq_id scan still pass, so the
+            // scan ALSO verifies pos == i and falls back to the serial path there.
+            bool fast_mask = false;
+            int64_t mask_bound_full = 0;
+            int64_t mask_bound_swa  = 0;
+            if (ik_mask_fast_enabled() && !hparams.use_alibi && cparams.flash_attn && hparams.n_attn_chunk == 0 &&
+                    n_kv >= 1024 && n_tokens >= 32 && (int64_t) mask_kv_self.used == n_kv) {
+                const llama_seq_id sid = batch.seq_id[0][0];
+                bool ok = true;
+                for (int j = 0; j < n_tokens && ok; ++j) {
+                    ok = batch.n_seq_id[j] == 1 && batch.seq_id[j][0] == sid;
+                }
+                if (ok) {
+                    for (int64_t i = 0; i < n_kv && ok; ++i) {
+                        ok = mask_kv_self.cells[i].has_seq_id(sid) &&
+                             mask_kv_self.cells[i].pos == (llama_pos) i;
+                    }
+                }
+                if (ok) {
+                    llama_pos min_pos = batch.pos[0];
+                    for (int j = 1; j < n_tokens; ++j) {
+                        min_pos = std::min(min_pos, batch.pos[j]);
+                    }
+                    mask_bound_full = std::max<int64_t>(0, (int64_t) min_pos);
+                    mask_bound_swa  = std::max<int64_t>(0, (int64_t) min_pos - (int64_t) n_swa_eff);
+                    fast_mask = mask_bound_full > 0 || mask_bound_swa > 0;
+                }
+            }
+
             if (n_kv >= 1024 && n_tokens >= 32) {
                 int n_thread = std::max(1, int(std::thread::hardware_concurrency()/2));
                 int npt = (n_kv + n_thread - 1)/n_thread;
-                auto compute = [&batch, &mask_kv_self, &hparams, &cparams, &noalibi_f16, n_tokens, n_kv, n_swa_eff, npt, data, data_swa, data_f16, data_swa_f16] (int ith) {
+                auto compute = [&batch, &mask_kv_self, &hparams, &cparams, &noalibi_f16, n_tokens, n_kv, n_swa_eff, npt, data, data_swa, data_f16, data_swa_f16, fast_mask, mask_bound_full, mask_bound_swa] (int ith) {
                     int first = ith * npt;
                     int last  = std::min(int(n_kv), first + npt);
                     if (last <= first) return;
+                    if (fast_mask) {
+                        const int64_t cs = std::min<int64_t>(last, mask_bound_swa);
+                        const int64_t cf = std::min<int64_t>(last, mask_bound_full);
+                        const ggml_half h_inf_f  = ggml_fp32_to_fp16(-INFINITY);
+                        const ggml_half h_zero_f = ggml_fp32_to_fp16(0.f);
+                        if (first < cs) {
+                            for (int j = 0; j < n_tokens; ++j) {
+                                if (data_swa)     std::fill(data_swa     + int64_t(j)*n_kv + first, data_swa     + int64_t(j)*n_kv + cs, -INFINITY);
+                                if (data_swa_f16) std::fill(data_swa_f16 + int64_t(j)*n_kv + first, data_swa_f16 + int64_t(j)*n_kv + cs, h_inf_f);
+                            }
+                        }
+                        if (first < cf) {
+                            for (int j = 0; j < n_tokens; ++j) {
+                                if (data)     std::fill(data     + int64_t(j)*n_kv + first, data     + int64_t(j)*n_kv + cf, 0.0f);
+                                if (data_f16) std::fill(data_f16 + int64_t(j)*n_kv + first, data_f16 + int64_t(j)*n_kv + cf, h_zero_f);
+                            }
+                        }
+                        const int64_t pc = std::max<int64_t>(first, std::min(mask_bound_full, mask_bound_swa));
+                        if (pc < last) {
+                            for (int j = 0; j < n_tokens; ++j) {
+                                noalibi_f16(j, batch.pos[j], batch.seq_id[j][0], (int) pc, last);
+                            }
+                        }
+                        return;
+                    }
                     for (int j = 0; j < n_tokens; ++j) {
                         const llama_pos    pos    = batch.pos[j];
                         const llama_seq_id seq_id = batch.seq_id[j][0];
