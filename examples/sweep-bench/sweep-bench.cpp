@@ -263,7 +263,7 @@ static void print_usage(int argc, char ** argv) {
     LOG_TEE("\nenvironment switches (default off, resident instrumentation):\n");
     LOG_TEE("  IK_SWEEP_DIAG=1                 stderr diag lines, prefixed and flushed\n");
     LOG_TEE("  IK_SWEEP_DIAG_FILE=PATH         additionally append diag lines to this file\n");
-    LOG_TEE("  IK_SWEEP_NVTX=1                 NVTX ranges W<i> per measured window, FILL@<n_kv> while fast-filling\n");
+    LOG_TEE("  IK_SWEEP_NVTX=1                 NVTX ranges W<i> per measured window with W<i>-tg / W<i>-pp sub-phases, FILL@<n_kv> while fast-filling\n");
     LOG_TEE("  -wb,   --warmup-batch           run a warmup batch before measurement\n");
     LOG_TEE("         --output-format FORMAT    output format: table (default) or jsonl\n");
     LOG_TEE("\nexample usage:\n");
@@ -496,6 +496,10 @@ int main(int argc, char ** argv) {
             nvtx.range(label);
             sweep_diag("window %d n_kv=%u nrep=%d tg begin", i_loop, n_kv, nrep);
 
+            char sub[32];
+            snprintf(sub, sizeof(sub), "W%d-tg", i_loop);
+            nvtx.range(sub);
+
             rep_tg.reserve(nrep);
             for (int irep = 0; irep < nrep; ++irep) {
                 // reset BEFORE the timer: the checkpoint restore cost grows with
@@ -518,6 +522,7 @@ int main(int argc, char ** argv) {
 
                 rep_tg.push_back(ggml_time_us() - rep_start);
             }
+            nvtx.end();
 
             sweep_diag("window %d n_kv=%u tg end (median %.3fs of %d reps)", i_loop, n_kv,
                        sweep_median_us(rep_tg) / 1e6, nrep);
@@ -530,6 +535,10 @@ int main(int argc, char ** argv) {
 
         // measure prompt processing performance
         if (measure) {
+            char sub[32];
+            snprintf(sub, sizeof(sub), "W%d-pp", i_loop);
+            nvtx.range(sub);
+
             rep_pp.reserve(nrep);
             for (int irep = 0; irep < nrep; ++irep) {
                 if (!rep_reset()) {
@@ -544,6 +553,7 @@ int main(int argc, char ** argv) {
 
                 rep_pp.push_back(ggml_time_us() - rep_start);
             }
+            nvtx.end();
 
             sweep_diag("window %d n_kv=%u pp end (median %.3fs of %d reps)", i_loop, n_kv,
                        sweep_median_us(rep_pp) / 1e6, nrep);
