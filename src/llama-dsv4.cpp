@@ -12,6 +12,10 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -19,6 +23,87 @@
 #include <stdexcept>
 #include <type_traits>
 #include <unordered_set>
+
+// env-gated sub-phase timers (IK_TRACE=1) inside llama_prepare_dsv4_graph_inputs.
+// Mirrors the IK_TMARK chain format used in llama.cpp so the split lands on the
+// same timeline as the top-level dsv4-inputs-2 mark.
+static thread_local long long dsv4_trace_prev_us = 0;
+static inline bool dsv4_trace_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("IK_TRACE");
+        v = e ? atoi(e) : 0;
+    }
+    return v != 0;
+}
+#define IK_DSV4_TMARK(name) do { \
+    if (dsv4_trace_enabled()) { \
+        long long now = ggml_time_us(); \
+        long long d = dsv4_trace_prev_us ? now - dsv4_trace_prev_us : 0; \
+        fprintf(stderr, "[dsv4-trace] %-24s +%lld us  (t=%lld ms)\n", name, d, now / 1000); \
+        dsv4_trace_prev_us = now; \
+    } } while (0)
+
+// IK_DSV4_MASK_VERIFY=1: after a device-side mask fill, read the mask back and
+// compare every cell against the host-computed staircase (bit-exact check for
+// the GPU fill path). No-op by default.
+static inline bool dsv4_mask_verify_enabled() {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("IK_DSV4_MASK_VERIFY");
+        v = e ? atoi(e) : 0;
+    }
+    return v != 0;
+}
+
+static void dsv4_verify_mask_tensor(
+        const ggml_tensor * tensor,
+        const llama_context::dsv4_runtime::comp_plan & plan,
+        int32_t n_tokens) {
+    const int64_t width  = tensor->ne[0];
+    const int64_t height = tensor->ne[1];
+    const size_t n_cells = (size_t) width*height;
+
+    if (tensor->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> host(n_cells, (ggml_fp16_t) 0x0000);
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            const int32_t nv = i < (int32_t) plan.n_visible.size() ? plan.n_visible[(size_t) i] : 0;
+            const int32_t nvis = std::min(std::max(0, nv), (int32_t) width);
+            if (nvis < width) {
+                std::fill(host.data() + (size_t) i*width + nvis, host.data() + (size_t) (i + 1)*width, (ggml_fp16_t) 0xFC00);
+            }
+        }
+        std::vector<ggml_fp16_t> dev(n_cells);
+        ggml_backend_tensor_get(tensor, dev.data(), 0, n_cells*sizeof(ggml_fp16_t));
+        size_t mism = 0;
+        for (size_t k = 0; k < n_cells; ++k) {
+            if (dev[k] != host[k]) {
+                ++mism;
+            }
+        }
+        fprintf(stderr, "[dsv4-mask-verify] %s F16 %ldx%ld mism=%zu/%zu\n",
+                tensor->name ? tensor->name : "?", (long) width, (long) height, mism, n_cells);
+    } else {
+        std::vector<float> host(n_cells, 0.0f);
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            const int32_t nv = i < (int32_t) plan.n_visible.size() ? plan.n_visible[(size_t) i] : 0;
+            const int32_t nvis = std::min(std::max(0, nv), (int32_t) width);
+            if (nvis < width) {
+                std::fill(host.data() + (size_t) i*width + nvis, host.data() + (size_t) (i + 1)*width, -INFINITY);
+            }
+        }
+        std::vector<float> dev(n_cells);
+        ggml_backend_tensor_get(tensor, dev.data(), 0, n_cells*sizeof(float));
+        size_t mism = 0;
+        for (size_t k = 0; k < n_cells; ++k) {
+            if (std::memcmp(&dev[k], &host[k], sizeof(float)) != 0) {
+                ++mism;
+            }
+        }
+        fprintf(stderr, "[dsv4-mask-verify] %s F32 %ldx%ld mism=%zu/%zu\n",
+                tensor->name ? tensor->name : "?", (long) width, (long) height, mism, n_cells);
+    }
+}
 
 static bool dsv4_cache_type_supported(ggml_type type) {
     return type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 || type == GGML_TYPE_Q8_0;
@@ -860,28 +945,76 @@ static void dsv4_set_mask_tensor(
     auto type = tensor->type;
     GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
 
-    //printf("%s: preparing mask %s of type %s with %ld x %ld entries\n", __func__, tensor->name, ggml_type_name(type), tensor->ne[0], tensor->ne[1]);
+#ifdef GGML_USE_CUDA
+    // Device-side fill: write the staircase mask directly into the CUDA buffer
+    // (16KB n_visible upload + one kernel), avoiding the ~537MB host memset and
+    // the ~537MB H2D per deep-context window. Falls back to the host path below
+    // when the tensor is not on a regular CUDA buffer.
+    if (ggml_backend_cuda_dsv4_fill_mask(tensor, plan.n_visible.data(), n_tokens)) {
+        if (dsv4_mask_verify_enabled()) {
+            dsv4_verify_mask_tensor(tensor, plan, n_tokens);
+        }
+        IK_DSV4_TMARK("mask_cuda_fill");
+        return;
+    }
+    if (dsv4_trace_enabled()) {
+        fprintf(stderr, "[dsv4-mask] cuda fill declined: buf=%s type=%s typeid=%d ne=%lldx%lld n_tokens=%d n_visible=%zu\n",
+                ggml_backend_buffer_name(tensor->buffer),
+                ggml_backend_buft_name(ggml_backend_buffer_get_type(tensor->buffer)),
+                (int) tensor->type, (long long) tensor->ne[0], (long long) tensor->ne[1],
+                n_tokens, plan.n_visible.size());
+    }
+#endif
+
+    // Reuse thread-local scratch buffers across windows: the mask grows with the
+    // compression depth (width == n_kv), so re-allocating the full buffer every
+    // window faults fresh pages and re-touches ~500MB for the csa mask at deep
+    // context (n_kv = n_ctx/CSA_RATIO = 65536 cols at c=262144). A persistent
+    // capacity turns the per-window cost into warm memset + fill + H2D.
+    // The visible region is a row prefix and dominates the deep-context mask
+    // (~99% of cells at the tail), so we zero the whole buffer first and fill
+    // only the -INF suffix band (the staircase edge, a few MB), halving the
+    // host write traffic versus the previous full -INF init + per-cell zero pass.
+    static thread_local std::vector<ggml_fp16_t> mask_scratch_f16;
+    static thread_local std::vector<float>       mask_scratch_f32;
+
     if (type == GGML_TYPE_F16) {
         auto h_inf = ggml_fp32_to_fp16(-INFINITY);
-        auto h_zero = ggml_fp32_to_fp16(0.0f);
-        std::vector<ggml_fp16_t> storage((size_t) width*height, h_inf);
+        const size_t n_cells = (size_t) width*height;
+        if (mask_scratch_f16.capacity() < n_cells) {
+            mask_scratch_f16.resize(n_cells);
+        }
+        IK_DSV4_TMARK("mask_zero_init");
+        memset(mask_scratch_f16.data(), 0, n_cells*sizeof(ggml_fp16_t));
+        ggml_fp16_t * storage = mask_scratch_f16.data();
         for (int32_t i = 0; i < n_tokens; ++i) {
             const int32_t n_visible = i < (int32_t) plan.n_visible.size() ? plan.n_visible[(size_t) i] : 0;
-            //if (i == 0) printf("    n_visible = %d\n", n_visible);
-            for (int32_t j = 0; j < n_visible && j < width; ++j) {
-                storage[(size_t) i*width + j] = h_zero;
+            const int32_t n_vis = std::min(std::max(0, n_visible), (int32_t) width);
+            if (n_vis < width) {
+                std::fill(storage + (size_t) i*width + n_vis, storage + (size_t) (i + 1)*width, h_inf);
             }
         }
-        ggml_backend_tensor_set(tensor, storage.data(), 0, storage.size()*sizeof(ggml_fp16_t));
+        IK_DSV4_TMARK("mask_inf_fill");
+        ggml_backend_tensor_set(tensor, storage, 0, n_cells*sizeof(ggml_fp16_t));
+        IK_DSV4_TMARK("mask_h2d");
     } else {
-        std::vector<float> storage((size_t) width*height, -INFINITY);
+        const size_t n_cells = (size_t) width*height;
+        if (mask_scratch_f32.capacity() < n_cells) {
+            mask_scratch_f32.resize(n_cells);
+        }
+        IK_DSV4_TMARK("mask_zero_init");
+        memset(mask_scratch_f32.data(), 0, n_cells*sizeof(float));
+        float * storage = mask_scratch_f32.data();
         for (int32_t i = 0; i < n_tokens; ++i) {
             const int32_t n_visible = i < (int32_t) plan.n_visible.size() ? plan.n_visible[(size_t) i] : 0;
-            for (int32_t j = 0; j < n_visible && j < width; ++j) {
-                storage[(size_t) i*width + j] = 0.0f;
+            const int32_t n_vis = std::min(std::max(0, n_visible), (int32_t) width);
+            if (n_vis < width) {
+                std::fill(storage + (size_t) i*width + n_vis, storage + (size_t) (i + 1)*width, -INFINITY);
             }
         }
-        ggml_backend_tensor_set(tensor, storage.data(), 0, storage.size()*sizeof(float));
+        IK_DSV4_TMARK("mask_inf_fill");
+        ggml_backend_tensor_set(tensor, storage, 0, n_cells*sizeof(float));
+        IK_DSV4_TMARK("mask_h2d");
     }
 }
 
@@ -2040,16 +2173,17 @@ bool llama_prepare_dsv4_graph_inputs(llama_context & lctx, const llama_batch & b
     if (!reserve_plan && !dsv4_build_raw_context(lctx, batch, lctx.dsv4.raw)) {
         return false;
     }
+    IK_DSV4_TMARK("raw_context");
 
-    //auto tim1 = ggml_time_us();
     lctx.dsv4.csa_plan = build_plan(llama_context::dsv4_runtime::CSA_RATIO, true, csa_state_size, csa_kv_size, cache_n_stream);
     lctx.dsv4.hca_plan = build_plan(llama_context::dsv4_runtime::HCA_RATIO, false, hca_state_size, hca_kv_size, cache_n_stream);
     lctx.dsv4.lid_plan = build_plan(llama_context::dsv4_runtime::CSA_RATIO, true, lid_state_size, lid_kv_size, cache_n_stream);
+    IK_DSV4_TMARK("build_plans");
+
     lctx.dsv4.csa_ctx = dsv4_build_comp_context(batch, cache_n_stream, lctx.dsv4.csa_plan.n_kv);
     lctx.dsv4.hca_ctx = dsv4_build_comp_context(batch, cache_n_stream, lctx.dsv4.hca_plan.n_kv);
     lctx.dsv4.lid_ctx = dsv4_build_comp_context(batch, cache_n_stream, lctx.dsv4.lid_plan.n_kv);
-    //auto tim2 = ggml_time_us();
-    //fprintf(stderr, "%s: %ld us to buils plans\n", __func__, tim2-tim1);
+    IK_DSV4_TMARK("build_contexts");
 
     if (!dsv4_validate_comp_plan("csa", batch, lctx.dsv4.csa_plan, llama_context::dsv4_runtime::CSA_RATIO, true, csa_state_size, csa_kv_size, cache_n_stream) ||
         !dsv4_validate_comp_plan("hca", batch, lctx.dsv4.hca_plan, llama_context::dsv4_runtime::HCA_RATIO, false, hca_state_size, hca_kv_size, cache_n_stream) ||
@@ -2057,16 +2191,16 @@ bool llama_prepare_dsv4_graph_inputs(llama_context & lctx, const llama_batch & b
         !dsv4_validate_csa_lid_visibility(lctx, csa_kv_size, lid_kv_size)) {
         return false;
     }
+    IK_DSV4_TMARK("validations");
 
     if (!set_tensors) {
         return true;
     }
 
-    //tim1 = ggml_time_us();
-
     dsv4_set_input_tensor(lctx.dsv4.inputs.raw_k_write_src_idxs, lctx.dsv4.raw.write_src_idxs);
     dsv4_set_input_tensor(lctx.dsv4.inputs.raw_k_write_idxs, lctx.dsv4.raw.write_dst_idxs);
     dsv4_set_input_tensor(lctx.dsv4.inputs.raw_k_read_idxs, lctx.dsv4.raw.read_dst_idxs);
+    IK_DSV4_TMARK("set_raw_idxs");
 
     auto set_comp = [&](llama_context::dsv4_runtime::comp_inputs & inputs, llama_context::dsv4_runtime::comp_plan & plan, bool set_mask) {
         dsv4_set_input_tensor(inputs.state_pos, plan.state_pos);
@@ -2081,12 +2215,12 @@ bool llama_prepare_dsv4_graph_inputs(llama_context & lctx, const llama_batch & b
     };
 
     set_comp(lctx.dsv4.inputs.csa, lctx.dsv4.csa_plan, true);
+    IK_DSV4_TMARK("set_csa");
     set_comp(lctx.dsv4.inputs.hca, lctx.dsv4.hca_plan, true);
+    IK_DSV4_TMARK("set_hca");
     set_comp(lctx.dsv4.inputs.lid, lctx.dsv4.lid_plan, false);
+    IK_DSV4_TMARK("set_lid");
     llama_dsv4_spec_ckpt_record_plan(&lctx);
-
-    //tim2 = ggml_time_us();
-    //fprintf(stderr, "%s: setting input tensors took %ld us\n", __func__, tim2 - tim1);
 
     return true;
 }

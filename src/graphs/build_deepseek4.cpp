@@ -1292,6 +1292,22 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
     dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.hca, lctx.dsv4.hca_plan, "dsv4_hca", n_tokens, true, lctx.cparams.flash_attn);
     dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.lid, lctx.dsv4.lid_plan, "dsv4_lid", n_tokens, false, lctx.cparams.flash_attn);
 
+    // Place the deep-context CSA mask directly on the GPU device buffer instead of the
+    // default pinned host input buffer. dsv4_set_mask_tensor then fills the 65536x4096
+    // F16 staircase in place with a device kernel (~1ms) instead of a ~537MB host memset
+    // plus the scheduler's pinned->device transfer. Without this, the input's buffer type
+    // is host, the sched assigns it to the CPU backend, and every deep window pays both
+    // the host fill and a hidden 537MB H2D. IK_DSV4_MASK_DEVICE=0 restores the pinned-host
+    // path (used for layout-controlled A/B against the same binary).
+    if (getenv("IK_DSV4_MASK_DEVICE") == nullptr || strcmp(getenv("IK_DSV4_MASK_DEVICE"), "0") != 0) {
+        for (auto * backend : lctx.backends) {
+            if (!ggml_backend_is_cpu(backend) && lctx.dsv4.inputs.csa.kq_mask != nullptr) {
+                ggml_backend_sched_set_tensor_backend(lctx.sched, lctx.dsv4.inputs.csa.kq_mask, backend);
+                break;
+            }
+        }
+    }
+
     ggml_tensor * inp_pos = build_inp_pos();
     // build only the mask the graph consumes; an input tensor without a consumer is never allocated
     ggml_tensor * KQ_mask = nullptr;

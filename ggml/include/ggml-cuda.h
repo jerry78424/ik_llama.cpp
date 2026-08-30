@@ -25,6 +25,11 @@ GGML_API GGML_CALL ggml_backend_t ggml_backend_cuda_init(int device, const void 
 
 GGML_API GGML_CALL bool ggml_backend_is_cuda(ggml_backend_t backend);
 
+// DSV4 device-side kq_mask fill: writes mask[i][j] = (j < n_visible[i]) ? 0 : -INF
+// directly into the input tensor's CUDA buffer. Returns false when the tensor is
+// not on a regular CUDA buffer (caller must fall back to the host path).
+GGML_API GGML_CALL bool ggml_backend_cuda_dsv4_fill_mask(struct ggml_tensor * mask, const int32_t * n_visible, int64_t n_tokens);
+
 // device buffer
 GGML_API GGML_CALL ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
 

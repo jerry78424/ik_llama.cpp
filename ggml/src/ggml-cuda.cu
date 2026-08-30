@@ -666,6 +666,82 @@ GGML_CALL static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t 
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+// --- DSV4 compressed-attention mask fill (device-side) ----------------------
+// Fills the dsv4 csa/hca kq_mask input tensor's buffer directly on the GPU from
+// the n_visible staircase: mask[i][j] = (j < n_visible[i]) ? +0.0 : -INF.
+// The mask stays a plain input tensor set before graph compute (outside graph
+// capture); this replaces the ~537MB host memset + H2D per deep-context window.
+// Returns false (caller falls back to the host path) when the buffer is not a
+// regular CUDA buffer (e.g. split/multi-GPU or CPU-only build).
+static __global__ void dsv4_fill_mask_f16_kernel(
+        ggml_fp16_t * mask, const int32_t * n_visible, const int32_t width, const int32_t n_tokens) {
+    const int32_t i = blockIdx.y*blockDim.y + threadIdx.y;
+    const int32_t j = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n_tokens || j >= width) {
+        return;
+    }
+    const int32_t nv = n_visible[i];
+    mask[(size_t) i*width + j] = (j < nv) ? (ggml_fp16_t) 0x0000 : (ggml_fp16_t) 0xFC00;
+}
+
+static __global__ void dsv4_fill_mask_f32_kernel(
+        float * mask, const int32_t * n_visible, const int32_t width, const int32_t n_tokens) {
+    const int32_t i = blockIdx.y*blockDim.y + threadIdx.y;
+    const int32_t j = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n_tokens || j >= width) {
+        return;
+    }
+    const int32_t nv = n_visible[i];
+    mask[(size_t) i*width + j] = (j < nv) ? 0.0f : -INFINITY;
+}
+
+GGML_CALL bool ggml_backend_cuda_dsv4_fill_mask(ggml_tensor * mask, const int32_t * n_visible, int64_t n_tokens) {
+    if (mask == nullptr || mask->buffer == nullptr || mask->data == nullptr || n_visible == nullptr || n_tokens <= 0) {
+        return false;
+    }
+    if (!ggml_backend_buffer_is_cuda(mask->buffer)) {
+        return false;
+    }
+    if (mask->type != GGML_TYPE_F16 && mask->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) mask->buffer->context;
+    ggml_cuda_set_device(ctx->device);
+    cudaStream_t stream = cudaStreamPerThread;
+
+    const int32_t width = (int32_t) mask->ne[0];
+    const int32_t ntoks = (int32_t) n_tokens;
+
+    // persistent per-thread scratch for the n_visible upload (16KB at 4096 tokens)
+    static thread_local int32_t * nv_buf = nullptr;
+    static thread_local int32_t   nv_cap = 0;
+    static thread_local int       nv_dev = -1;
+    if (nv_dev != ctx->device) {
+        CUDA_CHECK(cudaFree(nv_buf));
+        nv_buf = nullptr;
+        nv_cap = 0;
+        nv_dev = ctx->device;
+    }
+    if (nv_buf == nullptr || nv_cap < ntoks) {
+        CUDA_CHECK(cudaMalloc((void **) &nv_buf, (size_t) ntoks*sizeof(int32_t)));
+        nv_cap = ntoks;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(nv_buf, n_visible, (size_t) ntoks*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
+    const dim3 block(256, 4, 1);
+    const dim3 grid((width + 255)/256, (ntoks + 3)/4, 1);
+    if (mask->type == GGML_TYPE_F16) {
+        dsv4_fill_mask_f16_kernel<<<grid, block, 0, stream>>>((ggml_fp16_t *) mask->data, nv_buf, width, ntoks);
+    } else {
+        dsv4_fill_mask_f32_kernel<<<grid, block, 0, stream>>>((float *) mask->data, nv_buf, width, ntoks);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    return true;
+}
+
 GGML_CALL static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
 #ifndef NDEBUG
     printf("%s(%s -> %s)\n", __func__, src->name, dst->name);
