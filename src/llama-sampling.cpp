@@ -8,6 +8,7 @@
 #include <cstring>
 #include <ctime>
 #include <cfloat>
+#include <cmath>
 #include <numeric>
 #include <unordered_map>
 #include <fstream>
@@ -728,11 +729,20 @@ llama_token llama_sample_token_with_rng_impl(struct llama_sampling * smpl, llama
     auto iter = std::upper_bound(probs.begin(), probs.end(), p);
     if (iter == probs.end()) {
         LLAMA_LOG_ERROR("=============================== Failed to sample token\n");
+        int n_nan = 0, n_pos_inf = 0, n_neg_inf = 0, n_finite = 0;
+        for (int j = 0; j < candidates->size; ++j) {
+            const float l = candidates->data[j].logit;
+            if      (std::isnan(l)) n_nan++;
+            else if (std::isinf(l)) (l > 0 ? n_pos_inf : n_neg_inf)++;
+            else                    n_finite++;
+        }
         std::ofstream out("probabilities.txt");
         out << "candidates->size: " << candidates->size << std::endl;
+        out << "n_sample = " << (smpl ? smpl->n_sample : -1) << std::endl;
         out << "max  = " << max << std::endl;
         out << "sump = " << sump << std::endl;
         out << "r    = " << r << std::endl;
+        out << "logit class: nan=" << n_nan << " +inf=" << n_pos_inf << " -inf=" << n_neg_inf << " finite=" << n_finite << std::endl;
         out << "probabilities:\n";
         for (int j = 0; j < candidates->size; ++j) {
             out << j << "  " << candidates->data[j].id << "  " << candidates->data[j].logit << "  " << probs[j] << std::endl;

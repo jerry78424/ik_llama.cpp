@@ -239,6 +239,7 @@ void llama_sampling_set_rng_seed(struct common_sampler * ctx, uint32_t seed) {
     if (seed == LLAMA_DEFAULT_SEED) {
         seed = std::random_device{}();
     }
+    ctx->seed = seed;
     ctx->rng.seed(seed);
     ctx->speculative_seed = seed ^ COMMON_SPECULATIVE_VERIFIER_SEED_XOR;
     ctx->speculative_rng.seed(ctx->speculative_seed);
@@ -249,6 +250,7 @@ void common_sampler_clone(common_sampler * src, common_sampler * dst) {
     dst->mirostat_mu = src->mirostat_mu;
     dst->n_valid = src->n_valid;
     dst->rng = src->rng;
+    dst->seed = src->seed;
     dst->speculative_seed = src->speculative_seed;
     dst->speculative_rng = src->speculative_rng;
     dst->server_biases = src->server_biases;

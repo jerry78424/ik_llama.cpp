@@ -2042,6 +2042,7 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     LOG_INFO("slot is processing task", {
         {"id_slot", slot.id},
         {"id_task", slot.id_task},
+        {"seed", slot.ctx_sampling ? slot.ctx_sampling->seed : slot.sparams.seed},
         });
     slot.task = std::make_unique<const server_task>(std::move(task));
     return true;
