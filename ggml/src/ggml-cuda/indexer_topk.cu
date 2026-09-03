@@ -59,253 +59,6 @@ static __global__ void k_copy_topk(const int * __restrict__ sorted, int * dst, c
     }
 }
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
-#    define IK_CUB_AVAILABLE 1
-#    ifdef _WIN32
-#        ifndef WIN32_LEAN_AND_MEAN
-#            define WIN32_LEAN_AND_MEAN
-#        endif
-#        ifndef NOMINMAX
-#            define NOMINMAX
-#        endif
-#    endif
-#    include <cub/cub.cuh>
-using namespace cub;
-#endif
-
-// Exact top-k selection replacing the full per-row argsort in ggml_cuda_op_indexer_topk.
-//
-// The scores are m[i] + sum_head(relu(kq)*w[head]) with m drawn from the kq mask
-// (0.0 valid / -INF masked) and w learned weights that may be negative, so the
-// value domain is MIXED-SIGN. The descending float->uint key uses the monotonic
-// transform empirically matched to CUB DeviceRadixSort::SortPairsDescending
-// (verified 2026-09-02 with a standalone CUB probe on RTX 5090/sm_120):
-//     key = (u & 0x80000000) ? ~u : (u | 0x80000000)
-// so that -inf < ... < -0.0 < +0.0 < ... < +inf. Earlier attempts used
-// "(u & 0x80000000) ? u : ~u" and "(u & 0x80000000) ? u : (~u ^ 0x80000000)",
-// BOTH of which scramble the order (raw negative bits rank -inf above everything
-// and reverse the positives); the first caused the 2026-09-02 output regression
-// and the second was caught by the build gate (logits differed from baseline).
-//
-// The top-k set is extracted exactly:
-//   1. per-row 256-bucket histogram of key >> 24 (bucket ascending = score ascending)
-//   2. per-row boundary bucket b* scanned from the HIGHEST bucket down (the bucket
-//      containing the k-th largest key), segment size = buckets > b* plus all of b*
-//      (>= n_top_k by construction)
-//   3. survivors (bucket >= b*) compacted per row; composite uint64 key
-//      (key << 32) | (0xFFFFFFFF - index) so ties break by ascending index,
-//      matching the full stable radix sort's tie order deterministically
-//   4. DeviceSegmentedRadixSort::SortPairsDescending (capture-safe) over
-//      survivors; first n_top_k of each segment copied to dst
-// Downstream (ggml_indexer_mask, ggml_get_rows_ext) consumes the index SET only,
-// so set-exactness is sufficient; the index tie-break makes it bit-exact vs the
-// full sort and deterministic across runs.
-
-__device__ __forceinline__ uint32_t indexer_topk_key(float f) {
-    // Monotonic float -> uint transform for DESCENDING order, empirically matched
-    // against CUB DeviceRadixSort::SortPairsDescending (see tools note 2026-09-02):
-    //     -inf < ... < -0.0 < +0.0 < ... < +inf, ties by ascending index.
-    uint32_t u = __float_as_uint(f);
-    return (u & 0x80000000u) ? (~u) : (u | 0x80000000u);
-}
-
-static __global__ void k_topk_hist(const float * __restrict__ score,
-        unsigned int * __restrict__ hist, const int ncols, const int nrows) {
-    const int row = blockIdx.x;
-    if (row >= nrows) return;
-    __shared__ unsigned int s_hist[256];
-    for (int i = threadIdx.x; i < 256; i += blockDim.x) s_hist[i] = 0;
-    __syncthreads();
-    const float * s = score + (int64_t) row * ncols;
-    for (int i = threadIdx.x; i < ncols; i += blockDim.x) {
-        atomicAdd(&s_hist[indexer_topk_key(s[i]) >> 24], 1u);
-    }
-    __syncthreads();
-    for (int i = threadIdx.x; i < 256; i += blockDim.x) hist[(int64_t) row * 256 + i] = s_hist[i];
-}
-
-static __global__ void k_topk_boundary(const unsigned int * __restrict__ hist,
-        unsigned int * __restrict__ seg_size, unsigned int * __restrict__ seg_pos,
-        unsigned char * __restrict__ b_star, const int nrows, const int n_top_k) {
-    const int row = blockIdx.x;
-    if (row >= nrows) return;
-    const unsigned int * h = hist + (int64_t) row * 256;
-    unsigned int c_less = 0;
-    int b = 0;
-    // Buckets are ordered ascending with score (key = monotonic float transform),
-    // so scan from the HIGHEST bucket down to find the bucket holding the
-    // k-th LARGEST key. c_less = count of keys in buckets ABOVE b.
-    for (int i = 255; i >= 0; --i) {
-        if (c_less + h[i] >= (unsigned int) n_top_k) { b = i; break; }
-        c_less += h[i];
-    }
-    b_star[row]  = (unsigned char) b;
-    seg_size[row] = c_less + h[b];
-    seg_pos[row]  = 0;
-}
-
-static __global__ void k_topk_prefix(const unsigned int * __restrict__ seg_size,
-        int * __restrict__ seg_offset, const int nrows) {
-    constexpr int block = 256;
-    __shared__ unsigned int s_sums[block];
-    __shared__ unsigned int s_scan[block];
-    // Each thread owns a CONTIGUOUS chunk of rows. A strided assignment here is
-    // WRONG for nrows > 256: thread t's running prefix would then only cover its
-    // own strided rows, missing the other threads' rows in between, so seg_offset
-    // collides across rows and the compaction overwrites survivors (duplicate
-    // indices in dst). nrows reaches ~1725 in the fast prefill path.
-    const int chunk = (nrows + block - 1) / block;
-    const int start = threadIdx.x * chunk;
-    const int end = min(start + chunk, nrows);
-
-    unsigned int local = 0;
-    for (int i = start; i < end; ++i) local += seg_size[i];
-    s_sums[threadIdx.x] = local;
-    __syncthreads();
-
-    if (threadIdx.x == 0) {
-        unsigned int acc = 0;
-        for (int i = 0; i < block; ++i) { s_scan[i] = acc; acc += s_sums[i]; }
-        s_sums[block - 1] = acc;  // total survivors
-    }
-    __syncthreads();
-
-    unsigned int acc = s_scan[threadIdx.x];
-    for (int i = start; i < end; ++i) {
-        seg_offset[i] = (int) acc;
-        acc += seg_size[i];
-    }
-    if (threadIdx.x == 0) seg_offset[nrows] = (int) s_sums[block - 1];
-}
-
-static __global__ void k_topk_compact(const float * __restrict__ score,
-        const unsigned char * __restrict__ b_star, unsigned int * __restrict__ seg_pos,
-        const int * __restrict__ seg_offset, unsigned long long * __restrict__ surv_keys,
-        int * __restrict__ surv_vals, const int ncols, const int nrows) {
-    const int row = blockIdx.x;
-    if (row >= nrows) return;
-    const unsigned int b = b_star[row];
-    const float * s = score + (int64_t) row * ncols;
-    unsigned int * pos = seg_pos + row;
-    const int base = seg_offset[row];
-    for (int i = threadIdx.x; i < ncols; i += blockDim.x) {
-        const uint32_t key = indexer_topk_key(s[i]);
-        if ((key >> 24) >= b) {
-            const uint32_t p = atomicAdd(pos, 1u);
-            const unsigned long long k64 = ((unsigned long long) key << 32) | (0xFFFFFFFFu - (uint32_t) i);
-            surv_keys[base + p] = k64;
-            surv_vals[base + p] = i;
-        }
-    }
-}
-
-static __global__ void k_topk_copy_seg(const int * __restrict__ sorted_vals,
-        const int * __restrict__ seg_offset, int * __restrict__ dst,
-        const int n_top_k, const int nrows) {
-    const int row = blockIdx.x;
-    if (row >= nrows) return;
-    const int * src = sorted_vals + seg_offset[row];
-    int * d = dst + (int64_t) row * n_top_k;
-    for (int i = threadIdx.x; i < n_top_k; i += blockDim.x) d[i] = src[i];
-}
-
-static __global__ void k_topk_verify(const int * __restrict__ full, const int * __restrict__ sel,
-        const int n_top_k, const int nrows, int * __restrict__ mismatch) {
-    const int row = blockIdx.x;
-    extern __shared__ int s_sel[];
-    const int * fs = full + (int64_t) row * n_top_k;
-    const int * ss = sel  + (int64_t) row * n_top_k;
-    for (int i = threadIdx.x; i < n_top_k; i += blockDim.x) s_sel[i] = ss[i];
-    __syncthreads();
-    int local = 0;
-    for (int j = threadIdx.x; j < n_top_k; j += blockDim.x) {
-        const int v = fs[j];
-        bool found = false;
-        for (int i = 0; i < n_top_k; ++i) {
-            if (s_sel[i] == v) { found = true; break; }
-        }
-        if (!found) ++local;
-    }
-    if (local) atomicAdd(mismatch, local);
-}
-
-static void indexer_topk_select(ggml_backend_cuda_context & ctx, const float * score,
-        int * dst, const int ncols, const int nrows, const int n_top_k, cudaStream_t stream) {
-#ifdef IK_CUB_AVAILABLE
-    ggml_cuda_pool_alloc<unsigned int> hist(ctx.pool(), (size_t) nrows * 256);
-    ggml_cuda_pool_alloc<unsigned int> seg_size(ctx.pool(), (size_t) nrows);
-    ggml_cuda_pool_alloc<unsigned int> seg_pos(ctx.pool(), (size_t) nrows);
-    ggml_cuda_pool_alloc<unsigned char> b_star(ctx.pool(), (size_t) nrows);
-    ggml_cuda_pool_alloc<int> seg_offset(ctx.pool(), (size_t) nrows + 1);
-    ggml_cuda_pool_alloc<unsigned long long> surv_keys(ctx.pool(), (size_t) ncols * nrows);
-    ggml_cuda_pool_alloc<int> surv_vals(ctx.pool(), (size_t) ncols * nrows);
-    // Separate output buffers for the segmented sort: the CUB call is NOT allowed to alias
-    // input/output here because for an odd number of passes (11 for 64-bit keys) pass 1 reads
-    // AND writes the same buffer, which is only safe for single-tile segments. During decode the
-    // survivors can far exceed a single tile (boundary bucket heavily populated), so in-place is
-    // undefined behavior -> IMA. Distinct output buffers make every pass read/write different
-    // buffers (surv -> sorted -> tmp -> sorted), safe for any segment size.
-    ggml_cuda_pool_alloc<unsigned long long> sorted_keys(ctx.pool(), (size_t) ncols * nrows);
-    ggml_cuda_pool_alloc<int> sorted_vals(ctx.pool(), (size_t) ncols * nrows);
-
-    constexpr int k_block = 256;
-    k_topk_hist<<<nrows, k_block, 0, stream>>>(score, hist.get(), ncols, nrows);
-    CUDA_CHECK(cudaGetLastError());
-    k_topk_boundary<<<nrows, k_block, 0, stream>>>(hist.get(), seg_size.get(), seg_pos.get(), b_star.get(), nrows, n_top_k);
-    CUDA_CHECK(cudaGetLastError());
-    k_topk_prefix<<<1, k_block, 0, stream>>>(seg_size.get(), seg_offset.get(), nrows);
-    CUDA_CHECK(cudaGetLastError());
-    k_topk_compact<<<nrows, k_block, 0, stream>>>(score, b_star.get(), seg_pos.get(), seg_offset.get(),
-            surv_keys.get(), surv_vals.get(), ncols, nrows);
-    CUDA_CHECK(cudaGetLastError());
-
-    const int64_t num_items = (int64_t) ncols * nrows;  // upper bound; segments delimit the real data
-    size_t temp_storage_bytes = 0;
-    CUDA_CHECK(DeviceSegmentedRadixSort::SortPairsDescending(nullptr, temp_storage_bytes,
-            surv_keys.get(), sorted_keys.get(), surv_vals.get(), sorted_vals.get(),
-            (int) num_items, nrows, seg_offset.get(), seg_offset.get() + 1, 0, sizeof(unsigned long long) * 8, stream));
-    ggml_cuda_pool_alloc<uint8_t> temp_storage(ctx.pool(), temp_storage_bytes);
-    CUDA_CHECK(DeviceSegmentedRadixSort::SortPairsDescending(temp_storage.get(), temp_storage_bytes,
-            surv_keys.get(), sorted_keys.get(), surv_vals.get(), sorted_vals.get(),
-            (int) num_items, nrows, seg_offset.get(), seg_offset.get() + 1, 0, sizeof(unsigned long long) * 8, stream));
-    CUDA_CHECK(cudaGetLastError());
-
-    k_topk_copy_seg<<<nrows, k_block, 0, stream>>>(sorted_vals.get(), seg_offset.get(), dst, n_top_k, nrows);
-    CUDA_CHECK(cudaGetLastError());
-
-    static const bool verify = []() {
-        const char * e = getenv("IK_INDEXER_VERIFY");
-        return e != nullptr && e[0] != '\0';
-    }();
-    if (verify) {
-        // Only meaningful outside stream capture (the full argsort path is chosen
-        // by the same capture state, but the host sync below is illegal in capture).
-        cudaStreamCaptureStatus cap;
-        CUDA_CHECK(cudaStreamIsCapturing(stream, &cap));
-        if (cap == cudaStreamCaptureStatusNone && n_top_k <= 1024) {
-            ggml_cuda_pool_alloc<int> sorted(ctx.pool(), (size_t) ncols * nrows);
-            argsort_f32_i32_cuda_cub(ctx.pool(), score, sorted.get(), ncols, nrows, GGML_SORT_ORDER_DESC, stream);
-            ggml_cuda_pool_alloc<int> mismatch(ctx.pool(), 1);
-            CUDA_CHECK(cudaMemsetAsync(mismatch.get(), 0, sizeof(int), stream));
-            const int smem = n_top_k * sizeof(int);
-            k_topk_verify<<<nrows, k_block, smem, stream>>>(sorted.get(), dst, n_top_k, nrows, mismatch.get());
-            CUDA_CHECK(cudaGetLastError());
-            int h = 0;
-            CUDA_CHECK(cudaMemcpyAsync(&h, mismatch.get(), sizeof(int), cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            fprintf(stderr, "%s: IK_INDEXER_VERIFY: ncols=%d nrows=%d n_top_k=%d top-k set %s\n",
-                    __func__, ncols, nrows, n_top_k, h == 0 ? "MATCH" : "MISMATCH");
-        }
-    }
-#else
-    // No CUB: fall back to the full per-row argsort.
-    ggml_cuda_pool_alloc<int> sorted(ctx.pool(), (size_t) ncols * nrows);
-    argsort_f32_i32_cuda_cub(ctx.pool(), score, sorted.get(), ncols, nrows, GGML_SORT_ORDER_DESC, stream);
-    k_copy_topk<<<nrows, k_block, 0, stream>>>(sorted.get(), dst, ncols, n_top_k);
-    CUDA_CHECK(cudaGetLastError());
-#endif
-}
-
 void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     auto op = ggml_unary_op(dst->op_params[0]);
     GGML_ASSERT(op == GGML_UNARY_OP_RELU);
@@ -343,6 +96,7 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
         ggml_cuda_pool_alloc<half>  kq(ctx.pool(), int64_t(n_kv)*q->ne[1]*max_rows);
         ggml_cuda_pool_alloc<float> score(ctx.pool(), int64_t(n_kv)*max_rows);
+        ggml_cuda_pool_alloc<int>   sorted(ctx.pool(), int64_t(n_kv)*max_rows);
         ggml_cuda_pool_alloc<half>  q_f16(ctx.pool(), q->ne[0]*q->ne[1]*max_rows);
         ggml_cuda_pool_alloc<half>  k_f16(ctx.pool());
 
@@ -396,8 +150,11 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             }
             CUDA_CHECK(cudaGetLastError());
 
-            indexer_topk_select(ctx, score.get(),
-                    (int *)((char *)dst->data + first_row*dst->nb[1]), k->ne[1], nrows, dst->ne[0], ctx.stream());
+            argsort_f32_i32_cuda_cub(ctx.pool(), score.get(), sorted.get(), k->ne[1], nrows, GGML_SORT_ORDER_DESC, ctx.stream());
+            CUDA_CHECK(cudaGetLastError());
+
+            k_copy_topk<<<nrows, k_block_size, 0, ctx.stream()>>>(sorted.get(),
+                    (int *)((char *)dst->data + first_row*dst->nb[1]), k->ne[1], dst->ne[0]);
             CUDA_CHECK(cudaGetLastError());
         }
 
@@ -415,6 +172,7 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
     ggml_cuda_pool_alloc<float> kq(ctx.pool(), int64_t(n_kv)*max_rows*n_head);
     ggml_cuda_pool_alloc<float> score(ctx.pool(), int64_t(n_kv)*max_rows);
+    ggml_cuda_pool_alloc<int>   sorted(ctx.pool(), int64_t(n_kv)*max_rows);
     ggml_cuda_pool_alloc<float> k_f32(ctx.pool());
     ggml_cuda_pool_alloc<char>  q_converted(ctx.pool());
     const float * k_data = nullptr;
@@ -470,8 +228,11 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         }
         CUDA_CHECK(cudaGetLastError());
 
-        indexer_topk_select(ctx, score.get(),
-                (int *)((char *)dst->data + first*dst->nb[1]), k->ne[1], nrows, dst->ne[0], ctx.stream());
+        argsort_f32_i32_cuda_cub(ctx.pool(), score.get(), sorted.get(), k->ne[1], nrows, GGML_SORT_ORDER_DESC, ctx.stream());
+        CUDA_CHECK(cudaGetLastError());
+
+        k_copy_topk<<<nrows, k_block_size, 0, ctx.stream()>>>(sorted.get(), (int *)((char *)dst->data + first*dst->nb[1]),
+                k->ne[1], dst->ne[0]);
         CUDA_CHECK(cudaGetLastError());
     }
 
