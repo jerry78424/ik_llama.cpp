@@ -489,6 +489,8 @@ int main(int argc, char ** argv) {
         // first measure token generation performance at this context size
         std::vector<int64_t> rep_tg;
         std::vector<int64_t> rep_pp;
+        std::vector<int64_t> rep_tg_first;
+        std::vector<int64_t> rep_tg_last;
 
         if (measure) {
             char label[32];
@@ -501,6 +503,8 @@ int main(int argc, char ** argv) {
             nvtx.range(sub);
 
             rep_tg.reserve(nrep);
+            rep_tg_first.reserve(nrep);
+            rep_tg_last.reserve(nrep);
             for (int irep = 0; irep < nrep; ++irep) {
                 // reset BEFORE the timer: the checkpoint restore cost grows with
                 // KV depth and would otherwise ride into the measured time as a
@@ -510,22 +514,32 @@ int main(int argc, char ** argv) {
                 }
 
                 const int64_t rep_start = ggml_time_us();
+                int64_t first_step = 0;
+                int64_t last_step  = 0;
                 for (unsigned int i = 0; i < tg; ++i) {
                     common_batch_clear(batch);
                     common_batch_add(batch, std::rand() % n_vocab, n_kv + i, { 0 }, true);
 
+                    const int64_t step_start = ggml_time_us();
                     if (!decode_helper(ctx, batch, ctx_params.n_batch)) {
                         LOG_TEE("%s: llama_decode() failed\n", __func__);
                         return 1;
                     }
+                    const int64_t step_us = ggml_time_us() - step_start;
+                    if (i == 0) first_step = step_us;
+                    last_step = step_us;
                 }
 
                 rep_tg.push_back(ggml_time_us() - rep_start);
+                rep_tg_first.push_back(first_step);
+                rep_tg_last.push_back(last_step);
             }
             nvtx.end();
 
-            sweep_diag("window %d n_kv=%u tg end (median %.3fs of %d reps)", i_loop, n_kv,
-                       sweep_median_us(rep_tg) / 1e6, nrep);
+            const double t_tg_first = sweep_median_us(rep_tg_first) / 1e6;
+            const double t_tg_last  = sweep_median_us(rep_tg_last) / 1e6;
+            sweep_diag("window %d n_kv=%u tg end (median %.3fs of %d reps; first=%.3fs last=%.3fs)", i_loop, n_kv,
+                       sweep_median_us(rep_tg) / 1e6, nrep, t_tg_first, t_tg_last);
         } else {
             // keep the token stream aligned with a stride-1 sweep
             for (unsigned int i = 0; i < tg; ++i) {
@@ -573,6 +587,8 @@ int main(int argc, char ** argv) {
         // put ±1-2% noise straight into the curve and mask small steps)
         const double t_pp = sweep_median_us(rep_pp) / 1e6;
         const double t_tg = sweep_median_us(rep_tg) / 1e6;
+        const double t_tg_first = sweep_median_us(rep_tg_first) / 1e6;
+        const double t_tg_last  = sweep_median_us(rep_tg_last) / 1e6;
 
         const double speed_pp = pp / t_pp;
         const double speed_tg = tg / t_tg;
@@ -590,16 +606,16 @@ int main(int argc, char ** argv) {
                 const std::string vram_json = format_mib(vram_delta_mib, 3, "null");
                 LOG_TEE(
                     "{\"n_kv_max\": %d, \"n_batch\": %d, \"n_ubatch\": %d, \"flash_attn\": %d, \"n_gpu_layers\": %d, \"n_threads\": %u, \"n_threads_batch\": %u, "
-                    "\"win\": %d, \"ts\": %lld, \"pp\": %d, \"tg\": %d, \"n_kv\": %d, \"t_pp\": %f, \"speed_pp\": %f, \"t_tg\": %f, \"speed_tg\": %f, \"rss_hwm_mib\": %s, \"vram_delta_mib\": %s }\n",
+                    "\"win\": %d, \"ts\": %lld, \"pp\": %d, \"tg\": %d, \"n_kv\": %d, \"t_pp\": %f, \"speed_pp\": %f, \"t_tg\": %f, \"speed_tg\": %f, \"t_tg_first\": %f, \"t_tg_last\": %f, \"rss_hwm_mib\": %s, \"vram_delta_mib\": %s }\n",
                     n_kv_max, params.n_batch, params.n_ubatch, params.flash_attn, params.n_gpu_layers, ctx_params.n_threads, ctx_params.n_threads_batch,
-                    i_loop, sweep_wall_ms(), pp, tg, n_kv, t_pp, speed_pp, t_tg, speed_tg, rss_json.c_str(), vram_json.c_str()
+                    i_loop, sweep_wall_ms(), pp, tg, n_kv, t_pp, speed_pp, t_tg, speed_tg, t_tg_first, t_tg_last, rss_json.c_str(), vram_json.c_str()
                 );
             } else {
                 LOG_TEE(
                     "{\"n_kv_max\": %d, \"n_batch\": %d, \"n_ubatch\": %d, \"flash_attn\": %d, \"n_gpu_layers\": %d, \"n_threads\": %u, \"n_threads_batch\": %u, "
-                    "\"win\": %d, \"ts\": %lld, \"pp\": %d, \"tg\": %d, \"n_kv\": %d, \"t_pp\": %f, \"speed_pp\": %f, \"t_tg\": %f, \"speed_tg\": %f }\n",
+                    "\"win\": %d, \"ts\": %lld, \"pp\": %d, \"tg\": %d, \"n_kv\": %d, \"t_pp\": %f, \"speed_pp\": %f, \"t_tg\": %f, \"speed_tg\": %f, \"t_tg_first\": %f, \"t_tg_last\": %f }\n",
                     n_kv_max, params.n_batch, params.n_ubatch, params.flash_attn, params.n_gpu_layers, ctx_params.n_threads, ctx_params.n_threads_batch,
-                    i_loop, sweep_wall_ms(), pp, tg, n_kv, t_pp, speed_pp, t_tg, speed_tg
+                    i_loop, sweep_wall_ms(), pp, tg, n_kv, t_pp, speed_pp, t_tg, speed_tg, t_tg_first, t_tg_last
                 );
             }
         } else {

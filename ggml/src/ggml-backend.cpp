@@ -2293,12 +2293,10 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
             // with a large batch virtually every expert is used, so instead of waiting for
             // the routing ids, upload the full tensor through the prefetch backend and let
             // the copy overlap compute of the previous split.
-            // GGML_SCHED_PREFETCH_FULL_TENSOR=1 issues EVERY eligible host-weight input of
-            // the split into its own slot: no selective fallback, hence no per-layer device
-            // drains -- but also no inactive-expert byte savings (measured +12% H2D bytes,
-            // net -3% pp on DSV4 ub=8192 where the co-bound link prefers smaller slices).
-            // Default keeps the single-issue guard so later inputs stream through the
-            // selective path, which stays cheaper whenever experts are not all hit.
+            // The lookahead below stages this split's up AND gate (src[0]+src[1]) far ahead
+            // (during the previous split), so the gate is normally adopted here and this
+            // in-line single-issue fallback covers only the first split / pool-miss cases.
+            // GGML_SCHED_PREFETCH_FULL_TENSOR=1 additionally issues every eligible input.
             const bool prefetch_full_tensor = ggml_sched_prefetch_full_tensor_mode();
             if (sched->prefetch_experts && !sched->is_async && !sched->callback_eval &&
                     (prefetch_full_tensor || prefetch_issues.empty()) &&
@@ -2893,12 +2891,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
         // cross-split early upload: while this split's kernels (and the
         // per-layer prepare_row_mappings host barrier inside their dispatch)
-        // still run, stage the first eligible host-weight input of upcoming
-        // splits so the link carries future-layer weights instead of idling.
-        // Staged slots stay occupied until the consuming split's tail releases
-        // them, which bounds real concurrency to the pool size.
+        // still run, stage the MoE node's src[0] (up) AND src[1] (gate) of
+        // upcoming splits so the link carries future-layer weights instead of
+        // idling. The up and the down (each a node[0].src[0] of its own split)
+        // were already staged; the gate (src[1] of the MOE_FUSED_UP_GATE node)
+        // was the missing piece -- without this it streamed selectively on the
+        // compute stream every chunk (host barrier per mmq chunk, ~0.47s pp
+        // exclusive on DSV4 ub=4096). The 4 non-expert (VRAM-resident) layers
+        // are not host-weight inputs, so they never stage. Each staged tensor
+        // lands 1-2 splits ahead (the pool releases the consumed slots at the
+        // tail), so the full-tensor uploads are hidden behind the previous
+        // split's compute -- in-line same-split staging instead stalls the
+        // compute (~20ms/gate, measured). Staged slots stay occupied until the
+        // consuming split's tail releases them, which bounds real concurrency
+        // to the pool size.
         if (prefetch_ahead > 0 && sched->prefetch_experts && !sched->is_async && !sched->callback_eval) {
-            const bool prefetch_full_tensor = ggml_sched_prefetch_full_tensor_mode();
             // size the slot pool to the graph-wide maximum BEFORE any staging is
             // pushed, so buffer realloc/shrink can never invalidate pending slot
             // indices; later per-input init calls become no-ops. Only on a CUDA
@@ -2933,7 +2940,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                     if (already ||
                         !(jnode->src[0] == jinput_cpy ||
-                          (prefetch_full_tensor && jnode->src[1] == jinput_cpy)) ||
+                          jnode->src[1] == jinput_cpy) ||
                         !(ggml_backend_buffer_get_usage(jinput->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                           ggml_backend_buffer_is_host(jinput->buffer))) {
                         continue;
