@@ -519,11 +519,11 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
                 ncols * nrows, nrows,                               // num items, num segments
                 offset_iterator, offset_iterator + 1, 0, sizeof(float) * 8, stream));
         } else {
-            CUDA_CHECK(DeviceSegmentedSort::SortPairs(nullptr, temp_storage_bytes, temp_keys,
-                                                      temp_keys,             // keys (in-place)
-                                                      temp_indices, dst,     // values (indices)
-                                                      ncols * nrows, nrows,  // num items, num segments
-                                                      offset_iterator, offset_iterator + 1, stream));
+            CUDA_CHECK(DeviceSegmentedRadixSort::SortPairs(
+                nullptr, temp_storage_bytes, temp_keys, temp_keys,  // keys (in-place)
+                temp_indices, dst,                                  // values (indices)
+                ncols * nrows, nrows,                               // num items, num segments
+                offset_iterator, offset_iterator + 1, 0, sizeof(float) * 8, stream));
         }
     } else {
         if (nrows == 1) {
@@ -536,9 +536,9 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
                 nullptr, temp_storage_bytes, temp_keys, temp_keys, temp_indices, dst, ncols * nrows, nrows,
                 offset_iterator, offset_iterator + 1, 0, sizeof(float) * 8, stream));
         } else {
-            CUDA_CHECK(DeviceSegmentedSort::SortPairsDescending(nullptr, temp_storage_bytes, temp_keys, temp_keys,
-                                                                temp_indices, dst, ncols * nrows, nrows,
-                                                                offset_iterator, offset_iterator + 1, stream));
+            CUDA_CHECK(DeviceSegmentedRadixSort::SortPairsDescending(
+                nullptr, temp_storage_bytes, temp_keys, temp_keys, temp_indices, dst, ncols * nrows, nrows,
+                offset_iterator, offset_iterator + 1, 0, sizeof(float) * 8, stream));
         }
     }
 
@@ -556,9 +556,9 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
                                                            temp_indices, dst, ncols * nrows, nrows, offset_iterator,
                                                            offset_iterator + 1, 0, sizeof(float) * 8, stream));
         } else {
-            CUDA_CHECK(DeviceSegmentedSort::SortPairs(d_temp_storage, temp_storage_bytes, temp_keys, temp_keys,
-                                                      temp_indices, dst, ncols * nrows, nrows, offset_iterator,
-                                                      offset_iterator + 1, stream));
+            CUDA_CHECK(DeviceSegmentedRadixSort::SortPairs(d_temp_storage, temp_storage_bytes, temp_keys, temp_keys,
+                                                           temp_indices, dst, ncols * nrows, nrows, offset_iterator,
+                                                           offset_iterator + 1, 0, sizeof(float) * 8, stream));
         }
     } else {
         if (nrows == 1) {
@@ -571,9 +571,9 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
                 d_temp_storage, temp_storage_bytes, temp_keys, temp_keys, temp_indices, dst, ncols * nrows, nrows,
                 offset_iterator, offset_iterator + 1, 0, sizeof(float) * 8, stream));
         } else {
-            CUDA_CHECK(DeviceSegmentedSort::SortPairsDescending(d_temp_storage, temp_storage_bytes, temp_keys,
-                                                                temp_keys, temp_indices, dst, ncols * nrows, nrows,
-                                                                offset_iterator, offset_iterator + 1, stream));
+            CUDA_CHECK(DeviceSegmentedRadixSort::SortPairsDescending(
+                d_temp_storage, temp_storage_bytes, temp_keys, temp_keys, temp_indices, dst, ncols * nrows, nrows,
+                offset_iterator, offset_iterator + 1, 0, sizeof(float) * 8, stream));
         }
     }
 }
