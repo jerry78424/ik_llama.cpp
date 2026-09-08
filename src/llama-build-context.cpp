@@ -72,6 +72,7 @@ llm_build_context::llm_build_context(
         swa_head         (!kv_self.any_compacted() ? kv_head :
                           worst_case ? (int32_t) (kv_self.size_swa - n_tokens) : (int32_t) kv_self.head_swa),
         n_ctx_orig       (cparams.n_ctx_orig_yarn),
+        worst_case       (worst_case),
         flash_attn       (cparams.flash_attn),
         mla_attn         (cparams.mla_attn),
         attn_max_batch   (cparams.attn_max_batch),

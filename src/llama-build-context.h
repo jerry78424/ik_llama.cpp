@@ -81,6 +81,11 @@ struct llm_build_context {
     const int32_t swa_head; // same, for --swa-compress layers; equals kv_head otherwise
     const int32_t n_ctx_orig;
 
+    // true only for the reserve/worst_case graph build; lets input builders size
+    // state-dependent tensors (e.g. qsa win_*) at their worst-case extent so the
+    // reserved scratch buffer covers every real decode and never needs a re-pin
+    const bool worst_case;
+
     const bool flash_attn;
     const int  mla_attn;
     const int  attn_max_batch;

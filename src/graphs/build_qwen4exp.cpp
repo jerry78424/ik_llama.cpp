@@ -293,7 +293,10 @@ static ggml_tensor * qwen4exp_qsa_mask(
 
     // a raw key never changes once written, so only the blocks this ubatch wrote need pooling
     // again: n_tokens consecutive cells span n_tokens/r, plus one when the run straddles
-    const int32_t n_win = lctx.qsa_pooled_stale ? n_blocks : std::min(n_blocks, (n_tokens + r - 1)/r + 1);
+    // worst_case (the reserve graph) must size these at n_blocks too: a deep pp can hit
+    // qsa_pooled_stale and need the full extent, and the reserved host buffer has to fit
+    // that or it gets a ~6 GiB free+re-pin stall mid-sweep (the n_kv=258048 prefill cliff)
+    const int32_t n_win = (lctx.qsa_pooled_stale || bctx.worst_case) ? n_blocks : std::min(n_blocks, (n_tokens + r - 1)/r + 1);
 
     llama_context::qsa_input * inp = nullptr;
     for (auto & q : lctx.inp_qsa) {
