@@ -1304,8 +1304,13 @@ static void ggml_backend_sched_prefetch_disable(ggml_backend_sched_t sched, ggml
 }
 
 // slots are sized once for the largest offloaded expert tensor in the current graph so
-// that they never need to grow mid-eval
-static size_t ggml_backend_sched_prefetch_max_size(ggml_backend_sched_t sched) {
+// that they never need to grow mid-eval. Sizing uses ggml_backend_buft_get_alloc_size
+// rather than ggml_nbytes: the CUDA kernels may read past the last element of a weight
+// row (ne0 % MATRIX_ROW_PADDING != 0), and the buffer type's get_alloc_size adds exactly
+// the slack for that. A slot sized to bare ggml_nbytes can end exactly at the edge of
+// mapped device memory, turning that kernel-convention overshoot into an illegal memory
+// access (qwen4exp 850 MiB ffn_down experts, ne0=640, fault in MUL_MAT_ID over a slot).
+static size_t ggml_backend_sched_prefetch_max_size(ggml_backend_sched_t sched, ggml_backend_buffer_type_t buft) {
     size_t max_size = 0;
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &sched->splits[split_id];
@@ -1321,7 +1326,7 @@ static size_t ggml_backend_sched_prefetch_max_size(ggml_backend_sched_t sched) {
             if (input->buffer &&
                 ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                 ggml_backend_buffer_is_host(input->buffer)) {
-                max_size = std::max(max_size, ggml_nbytes(input));
+                max_size = std::max(max_size, ggml_backend_buft_get_alloc_size(buft, input));
             }
         }
     }
@@ -1376,9 +1381,12 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
 #endif
     }
 
-    size = std::max(size, ggml_backend_sched_prefetch_max_size(sched));
-
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(split_backend);
+    // padded sizes (see prefetch_max_size): the slot must be what the buffer type itself
+    // would reserve for the tensor, otherwise the kernel's row-padding overshoot reads
+    // past the end of the slot allocation
+    size = std::max(size, ggml_backend_sched_prefetch_max_size(sched, buft));
+
     for (int i = 0; i < sched->prefetch_n_slots; i++) {
         if (sched->prefetch_slots[i] == NULL || ggml_backend_buffer_get_size(sched->prefetch_slots[i]) < size) {
             // allocate before freeing so a failure leaves the old slot intact
@@ -2914,7 +2922,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             // probe on the wrong backend.
             if (!ahead_slots_presized && ggml_backend_is_cuda(split_backend)) {
                 ahead_slots_presized = true;
-                const size_t ahead_max_size = ggml_backend_sched_prefetch_max_size(sched);
+                const size_t ahead_max_size = ggml_backend_sched_prefetch_max_size(sched,
+                        ggml_backend_get_default_buffer_type(split_backend));
                 if (ahead_max_size > 0) {
                     ggml_backend_sched_prefetch_init(sched, split_backend, ahead_max_size);
                 }
