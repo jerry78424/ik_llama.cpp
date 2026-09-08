@@ -764,6 +764,30 @@ bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, c
 
         // even if there are no tensors allocated in this buffer, we still need to allocate it to initialize views
         if (new_size > cur_size || galloc->buffers[i] == NULL) {
+            // resident env-gated hook (default off): which host tensors make up this
+            // pinned-buffer peak. Set IK_GALLO_DUMP_HOST=1 to answer "which tensor is
+            // the delta when a host scratch buffer reallocs" without hand-patching.
+            // Fires only on (re)alloc of a host buft, so it stays quiet even when on.
+            if (getenv("IK_GALLO_DUMP_HOST") && ggml_backend_buft_is_host(galloc->bufts[i])) {
+                fprintf(stderr, "[IK_GALLO_DUMP] buft=%s new=%.2f MiB (nodes=%d leafs=%d)\n",
+                        ggml_backend_buft_name(galloc->bufts[i]), new_size/1048576.0, graph->n_nodes, graph->n_leafs);
+                for (int n = 0; n < graph->n_nodes; n++) {
+                    struct ggml_tensor * t = graph->nodes[n];
+                    if (galloc->node_allocs[n].dst.buffer_id == i) {
+                        fprintf(stderr, "  [IK_GALLO_DUMP] %9.2f MiB NODE %-14s %-28s ne=[%ld,%ld,%ld,%ld]\n",
+                                ggml_backend_buft_get_alloc_size(galloc->bufts[i], t)/1048576.0,
+                                ggml_op_name(t->op), t->name, (long)t->ne[0], (long)t->ne[1], (long)t->ne[2], (long)t->ne[3]);
+                    }
+                }
+                for (int n = 0; n < graph->n_leafs; n++) {
+                    struct ggml_tensor * t = graph->leafs[n];
+                    if (galloc->leaf_allocs[n].buffer_id == i) {
+                        fprintf(stderr, "  [IK_GALLO_DUMP] %9.2f MiB LEAF %-42s ne=[%ld,%ld,%ld,%ld]\n",
+                                ggml_backend_buft_get_alloc_size(galloc->bufts[i], t)/1048576.0,
+                                t->name, (long)t->ne[0], (long)t->ne[1], (long)t->ne[2], (long)t->ne[3]);
+                    }
+                }
+            }
 #ifndef NDEBUG
             fprintf(stderr, "%s: reallocating %s buffer from size %.02f MiB to %.02f MiB\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
 #endif
