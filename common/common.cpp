@@ -1263,6 +1263,22 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.speculative.n_ctx = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "-smb" || arg == "--spec-mtp-batch") {
+        CHECK_ARG
+        params.speculative.mtp_batch = std::stoi(argv[i]);
+        if (params.speculative.mtp_batch < 0) {
+            invalid_param = true;
+        }
+        return true;
+    }
+    if (arg == "-smu" || arg == "--spec-mtp-ubatch") {
+        CHECK_ARG
+        params.speculative.mtp_ubatch = std::stoi(argv[i]);
+        if (params.speculative.mtp_ubatch < 0) {
+            invalid_param = true;
+        }
+        return true;
+    }
     if (arg == "-gan" || arg == "--grp-attn-n") {
         CHECK_ARG
         params.grp_attn_n = std::stoi(argv[i]);
@@ -3272,6 +3288,8 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-ctv-first, --cache-type-v-first TYPE,N", "KV cache data type for the first N layers of V (default: %s,-1)", params.type_v_first.c_str() });
     options.push_back({ "*",           "-ctv-last,  --cache-type-v-last  TYPE,N", "KV cache data type for the last N layers of V  (default: %s,-1)", params.type_v_last.c_str() });
     options.push_back({ "*",           "-mtprot, --mtp-requantize-output-tensor type", "Use output requantized to type for MTP (default: %s)", params.extra_output_type.c_str() });
+    options.push_back({ "*",           "-smb,  --spec-mtp-batch N",    "n_batch of the embedded MTP context (default: %d, 0 = inherit the target n_batch)", params.speculative.mtp_batch });
+    options.push_back({ "*",           "-smu,  --spec-mtp-ubatch N",   "n_ubatch of the embedded MTP context (default: %d, 0 = follow -smb / the target n_ubatch)", params.speculative.mtp_ubatch });
     options.push_back({ "*",           "-ctkd, --cache-type-k-draft TYPE", "KV cache data type for K for the draft model" });
     options.push_back({ "*",           "-ctvd, --cache-type-v-draft TYPE", "KV cache data type for V for the draft model" });
 

@@ -222,6 +222,11 @@ struct common_params_speculative {
     int32_t n_min = 0; // minimum number of tokens to draft during speculative decoding
     std::vector<common_speculative_stage_params> stages; // explicit stage chain for single-spec or self-spec + model fallback
     int32_t mtp_heads = 1; // MTP heads to use; 1 is the default, while >1 and 0 (all model heads) are experimental
+    // Batch sizes of the embedded (self) MTP context. Compute buffers are per context, not
+    // per layer, so inheriting the target's n_batch/n_ubatch makes a 1-layer MTP graph
+    // reserve the same full-size scratch as the whole target. 0 = inherit the target.
+    int32_t mtp_batch  = 0;
+    int32_t mtp_ubatch = 0;
 
     // Samplers for DFlash2
     float    draft_temperature = 0.0f;

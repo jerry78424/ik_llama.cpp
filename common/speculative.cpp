@@ -257,7 +257,13 @@ static std::vector<llama_token> mtp_speculative_gen_draft(
     llama_seq_id seq_id,
     bool constant_draft_positions = false);
 
-static int32_t mtp_update_kv_cache(struct llama_context * ctx, const llama_batch & batch, bool is_prompt_warmup, int32_t mtp_heads);
+static int32_t mtp_update_kv_cache(
+        struct llama_context * ctx,
+        const llama_batch    & batch,
+        bool                   is_prompt_warmup,
+        int32_t                mtp_heads,
+        const float          * hidden_rows      = nullptr,
+        size_t                 hidden_row_floats = 0);
 
 struct mtp_last_embd {
     std::vector<float> embd;
@@ -2109,6 +2115,27 @@ bool common_speculative_prepare_mtp_runtime(
     if (!has_external_mtp) {
         gpt_params params_mtp = params_base;
         params_mtp.pooling_type = LLAMA_POOLING_TYPE_NONE;
+        // Compute buffers are per context, not per layer: inheriting the target's batch
+        // sizes makes the 1-layer MTP graph reserve the same full-size MoE scratch as the
+        // whole target (qwen4exp 512x56B at n_ubatch=4096: 12851 MiB CUDA + 6347 MiB host).
+        // -smb / -smu cap them; 0 keeps the inherit-the-target behavior.
+        if (params.mtp_batch > 0) {
+            // the accepted-token update hands this context one hidden row per draft window,
+            // so n_batch must still hold n_max+1 tokens in a single decode
+            const int32_t mtp_min_batch = std::max<int32_t>(1, params.n_max + 1);
+            const int32_t want = std::max(params.mtp_batch, mtp_min_batch);
+            if (want != params.mtp_batch) {
+                LOG_WRN("%s: -smb %d raised to %d (n_max+1)\n", __func__, params.mtp_batch, want);
+            }
+            params_mtp.n_batch = std::min(want, params_base.n_batch);
+        }
+        params_mtp.n_ubatch = params.mtp_ubatch > 0
+            ? std::min(params.mtp_ubatch, params_mtp.n_batch)
+            : std::min(params_mtp.n_ubatch, params_mtp.n_batch);
+        if (params.mtp_batch > 0 || params.mtp_ubatch > 0) {
+            LOG_INF("%s: embedded MTP context sizes: n_batch=%d n_ubatch=%d (target n_batch=%d n_ubatch=%d)\n",
+                    __func__, params_mtp.n_batch, params_mtp.n_ubatch, params_base.n_batch, params_base.n_ubatch);
+        }
         params.cparams_dft = common_context_params_to_llama(params_mtp);
     }
 
@@ -3174,7 +3201,8 @@ int32_t common_speculative_on_target_batch(
     if (!llama_set_draft_input_hidden_state_copy(mtp_state->ctx_mtp, conditioned_hidden_rows, hidden_rows_storage.size())) {
         return -1;
     }
-    const int32_t ret = mtp_update_kv_cache(mtp_state->ctx_mtp, batch, true, mtp_state->mtp_heads_active);
+    const int32_t ret = mtp_update_kv_cache(mtp_state->ctx_mtp, batch, true, mtp_state->mtp_heads_active,
+            conditioned_hidden_rows, (size_t) features.width);
     mtp_invalidate_cached_draft(*mtp_state, seq_id);
     return ret;
 }
@@ -3365,7 +3393,7 @@ std::vector<llama_token> mtp_speculative_gen_draft(
 }
 
 
-int32_t mtp_update_kv_cache(struct llama_context * ctx, const llama_batch& batch, bool is_prompt_warmup, int32_t mtp_heads) {
+int32_t mtp_update_kv_cache(struct llama_context * ctx, const llama_batch& batch, bool is_prompt_warmup, int32_t mtp_heads, const float * hidden_rows, size_t hidden_row_floats) {
     if (batch.n_tokens == 0) {
         return 0;
     }
@@ -3398,7 +3426,38 @@ int32_t mtp_update_kv_cache(struct llama_context * ctx, const llama_batch& batch
         llama_set_mtp_op_type(ctx, MTP_OP_UPDATE_ACCEPTED);
     }
 
-    const int32_t ret = llama_decode(ctx, mtp_batch);
+    // -smb can give this context a smaller n_batch than the target's, while the warmup
+    // batch arrives in the target's shape. llama_decode rejects an oversized batch and the
+    // last-token logit would be out of range, so replay in chunks of this context's n_batch;
+    // the last chunk carries the only logit and positions stay contiguous.
+    const uint32_t n_chunk = std::max<uint32_t>(1, llama_n_batch(ctx));
+    const size_t   embd_stride = mtp_batch.embd ? (size_t) llama_model_n_embd_inp(llama_get_model(ctx)) : 0;
+
+    int32_t ret = 0;
+    for (int off = 0; off < mtp_batch.n_tokens && ret == 0; off += (int) n_chunk) {
+        llama_batch chunk = mtp_batch;
+        chunk.n_tokens  = std::min<int>((int) n_chunk, mtp_batch.n_tokens - off);
+        chunk.token     = mtp_batch.token     ? mtp_batch.token     + off : nullptr;
+        chunk.embd      = mtp_batch.embd      ? mtp_batch.embd      + (size_t) off * embd_stride : nullptr;
+        chunk.pos       = mtp_batch.pos       ? mtp_batch.pos       + off : nullptr;
+        chunk.n_seq_id  = mtp_batch.n_seq_id  ? mtp_batch.n_seq_id  + off : nullptr;
+        chunk.seq_id    = mtp_batch.seq_id    ? mtp_batch.seq_id    + off : nullptr;
+        chunk.logits    = mtp_batch.logits    ? mtp_batch.logits    + off : nullptr;
+        if (!chunk.pos) {
+            chunk.all_pos_0 = mtp_batch.all_pos_0 + (llama_pos) off * mtp_batch.all_pos_1;
+        }
+        // prepare_mtp_graph_inputs derives the row width from the batch it is handed, so a
+        // chunked replay must also narrow the hidden-state buffer to this chunk instead of
+        // leaving the whole prompt's rows in place.
+        if (hidden_rows != nullptr && mtp_batch.n_tokens > (int) n_chunk) {
+            if (!llama_set_draft_input_hidden_state_copy(ctx,
+                    hidden_rows + (size_t) off * hidden_row_floats,
+                    (size_t) chunk.n_tokens * hidden_row_floats)) {
+                return -1;
+            }
+        }
+        ret = llama_decode(ctx, chunk);
+    }
     llama_set_mtp_step_idx(ctx, 0);
     llama_set_mtp_n_heads(ctx, 0);
     llama_set_mtp_op_type(ctx, MTP_OP_NONE);
