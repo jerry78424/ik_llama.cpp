@@ -1215,6 +1215,15 @@ static bool llama_mtp_tail_uses_layer_cache(const llama_model & model) {
          model.arch == LLM_ARCH_STEP35);
 }
 
+// The NextN tail KV belongs to the draft context alone: for this arch the target graph is built
+// over [0, n_layer - nextn) (graphs/build_qwen4exp.cpp: n_layer_end when mtp_op_type == MTP_OP_NONE)
+// so the target never reads or writes the tail layers, while the draft context allocates nothing but
+// them (the mtp_op_type != MTP_OP_NONE skip below). Allocating them in both contexts pays for one
+// full-attention layer twice.
+static bool llama_mtp_tail_owned_by_draft(const llama_model & model) {
+    return model.mtp && model.hparams.nextn_predict_layers > 0 && model.arch == LLM_ARCH_QWEN4EXP;
+}
+
 static bool llama_kv_cache_init(
              struct llama_kv_cache & cache,
                const llama_context * ctx,
@@ -1427,12 +1436,24 @@ static bool llama_kv_cache_init(
     int n_mla = 0;
     int n_kv_active_layers = 0;
     const int n_mtp_first_layer = hparams.n_layer - hparams.nextn_predict_layers;
+    const bool skip_target_mtp_tail = llama_mtp_tail_owned_by_draft(model) && cparams.mtp_op_type == MTP_OP_NONE;
     for (int i = 0; i < (int) n_layer; i++) {
         // For MTP-only context, skip KV allocation for non-MTP layers
         if (cparams.mtp_op_type != MTP_OP_NONE && i < n_mtp_first_layer) {
             cache.k_l.push_back(nullptr);
             if (!is_dsv4_k_only && model.arch != LLM_ARCH_OPENPANGU &&
                     (!is_mla_attn || !cparams.mla_attn || (cparams.mla_attn == 1 && !cparams.flash_attn))) {
+                cache.v_l.push_back(nullptr);
+            }
+            continue;
+        }
+        // The target graph stops before the NextN tail, so those layers stay unallocated here and
+        // the draft context keeps the only copy. Gated to the plain attention path so the k_l/v_l
+        // pushes match exactly what this layer would have produced.
+        if (skip_target_mtp_tail && i >= n_mtp_first_layer &&
+                (!is_mla_attn || !cparams.mla_attn) && !llama_is_recurrent_layer(hparams, i) && hparams.has_kv(i)) {
+            cache.k_l.push_back(nullptr);
+            if (!is_dsv4_k_only && model.arch != LLM_ARCH_OPENPANGU) {
                 cache.v_l.push_back(nullptr);
             }
             continue;
